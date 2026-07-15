@@ -120,7 +120,7 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-CI builds macOS (arm64 + x64) and Windows, drafts a GitHub Release, and uploads installers + `latest.json` for the updater.
+CI builds macOS (arm64 + x64) and Windows, publishes a GitHub Release, and uploads installers + `latest.json` for the updater.
 
 > Until the first signed release exists, **检查更新** may report that update metadata is unavailable — that is expected.
 
