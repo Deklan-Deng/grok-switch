@@ -101,16 +101,18 @@ npx tauri signer generate -w ~/.tauri/grok-switch.key --ci -f
 
 # Build release with signatures
 export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/grok-switch.key)"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""   # if empty password
+# Only if the key was generated WITH a password:
+# export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="your-password"
 npm run tauri build
 ```
 
-GitHub Actions (`.github/workflows/release.yml`) expects secrets:
+GitHub Actions (`.github/workflows/release.yml`) expects:
 
 | Secret | Value |
 |--------|--------|
-| `TAURI_SIGNING_PRIVATE_KEY` | Full private key file contents |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password (use empty secret if none) |
+| `TAURI_SIGNING_PRIVATE_KEY` | Full private key file contents (`pbcopy < ~/.tauri/grok-switch.key`) |
+
+**Do not create** `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` when the key has no password — GitHub Secrets cannot be empty, and leaving the env unset is how Tauri treats “no password”. Only add that secret if you later regenerate a password-protected key.
 
 Publish flow:
 

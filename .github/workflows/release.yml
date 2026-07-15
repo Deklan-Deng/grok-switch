@@ -2,8 +2,11 @@
 # (including latest.json for the in-app updater).
 #
 # Required repository secrets:
-#   TAURI_SIGNING_PRIVATE_KEY          — contents of the minisign private key
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — empty string if the key has no password
+#   TAURI_SIGNING_PRIVATE_KEY — full contents of the minisign private key file
+#
+# Do NOT create TAURI_SIGNING_PRIVATE_KEY_PASSWORD when the key has no password
+# (GitHub Secrets cannot be empty). Only add that secret if you regenerate the
+# key with a real password, then also set it in the env block below.
 #
 # Optional (macOS notarization / Apple signing — skip if you only need unsigned builds):
 #   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
@@ -61,8 +64,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Key was generated with empty password — omit PASSWORD env entirely.
+          # (GitHub rejects empty secrets; unset env means "no password" for Tauri.)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
