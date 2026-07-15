@@ -1,0 +1,84 @@
+# Build signed macOS + Windows installers and publish GitHub Release assets
+# (including latest.json for the in-app updater).
+#
+# Required repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY          — contents of the minisign private key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — empty string if the key has no password
+#
+# Optional (macOS notarization / Apple signing — skip if you only need unsigned builds):
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+#
+# Trigger: push a version tag, e.g. git tag v0.1.1 && git push origin v0.1.1
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install frontend deps
+        working-directory: app
+        run: npm ci
+
+      - name: Build & upload release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: "Grok Switch ${{ github.ref_name }}"
+          releaseBody: |
+            ## Grok Switch ${{ github.ref_name }}
+
+            Unofficial local desktop tool for Grok Build CLI providers.
+
+            ### Install
+            - **macOS**: download the `.dmg` for your chip (Apple Silicon / Intel)
+            - **Windows**: download the NSIS `.exe` or `.msi` installer
+
+            In-app updates use `latest.json` from this release (signed artifacts).
+          # Publish immediately so /releases/latest (and in-app updater) work.
+          # Set true if you prefer reviewing assets before going public.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

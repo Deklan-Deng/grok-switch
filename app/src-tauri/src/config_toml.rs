@@ -17,7 +17,11 @@ pub struct ModelUpsert {
 
 pub fn expand_path(path: &str) -> String {
     let trimmed = path.trim();
-    if let Some(rest) = trimmed.strip_prefix("~/") {
+    // Support ~/… and ~\… (Windows) as home-relative paths.
+    let rest = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"));
+    if let Some(rest) = rest {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().into_owned();
         }

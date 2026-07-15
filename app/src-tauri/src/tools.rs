@@ -61,6 +61,17 @@ fn default_config_path() -> String {
         .into_owned()
 }
 
+/// Hide console flash when a GUI app shells out on Windows.
+fn silence_console(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd;
+}
+
 fn which_grok() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(custom);
@@ -68,32 +79,75 @@ fn which_grok() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let home = home_grok_dir().join("bin").join("grok");
-    if home.exists() {
-        return Some(home);
+
+    let home_bin = home_grok_dir().join("bin");
+    for name in ["grok", "grok.exe"] {
+        let p = home_bin.join(name);
+        if p.exists() {
+            return Some(p);
+        }
     }
-    // Fall back to PATH lookup.
-    Command::new("/usr/bin/env")
-        .args(["which", "grok"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
+
+    // PATH lookup (platform-native).
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer where.exe (System32) over the bare name so PowerShell aliases
+        // never intercept us.
+        let mut cmd = Command::new("where.exe");
+        silence_console(&mut cmd);
+        cmd.arg("grok")
+            .output()
+            .ok()
+            .and_then(|o| {
+                if !o.status.success() {
+                    return None;
+                }
+                let s = String::from_utf8_lossy(&o.stdout);
+                let first = s.lines().next()?.trim();
+                if first.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(first))
+                }
+            })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("sh")
+            .args(["-lc", "command -v grok || which grok"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if !o.status.success() {
+                    return None;
+                }
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if s.is_empty() {
                     None
                 } else {
                     Some(PathBuf::from(s))
                 }
-            } else {
-                None
-            }
-        })
+            })
+    }
+}
+
+/// Absolute project path: Unix `/…` or Windows `C:\…` / `C:/…`.
+fn is_absolute_project_path(path: &str) -> bool {
+    let p = path.trim();
+    if p.starts_with('/') {
+        return true;
+    }
+    let b = p.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/')
 }
 
 fn grok_version(bin: &Path) -> Option<String> {
-    Command::new(bin)
-        .arg("--version")
+    let mut cmd = Command::new(bin);
+    silence_console(&mut cmd);
+    cmd.arg("--version")
         .output()
         .ok()
         .and_then(|o| {
@@ -128,8 +182,29 @@ fn decode_session_cwd(encoded: &str) -> String {
 fn short_path(path: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let home_s = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home_s.as_ref()) {
-            return format!("~{rest}");
+        // Case-insensitive home strip helps Windows drive-letter casing.
+        let path_norm = path.replace('\\', "/");
+        let home_norm = home_s.replace('\\', "/");
+        if let Some(rest) = path_norm
+            .strip_prefix(&home_norm)
+            .or_else(|| {
+                let hl = home_norm.to_ascii_lowercase();
+                let pl = path_norm.to_ascii_lowercase();
+                pl.strip_prefix(&hl).map(|r| &path_norm[path_norm.len() - r.len()..])
+            })
+        {
+            if rest.is_empty() {
+                return "~".into();
+            }
+            // Prefer ~\ on Windows for display when original used backslashes.
+            #[cfg(target_os = "windows")]
+            {
+                return format!("~{}", rest.replace('/', "\\"));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                return format!("~{rest}");
+            }
         }
     }
     path.to_string()
@@ -369,7 +444,7 @@ pub fn list_recent_sessions(limit: usize) -> Vec<GrokSessionItem> {
             continue;
         }
         let cwd = decode_session_cwd(&encoded);
-        if cwd.is_empty() || !cwd.starts_with('/') {
+        if cwd.is_empty() || !is_absolute_project_path(&cwd) {
             continue;
         }
 
@@ -448,7 +523,7 @@ pub fn delete_session_project(path_or_cwd: &str) -> Result<String, String> {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let cwd = decode_session_cwd(&name);
-        if cwd.starts_with('/') {
+        if is_absolute_project_path(&cwd) {
             short_path(&cwd)
         } else {
             short_path(&name)
@@ -486,10 +561,18 @@ pub fn open_path(path: &str) -> Result<String, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", &expanded])
-            .spawn()
-            .map_err(|e| format!("无法打开：{e}"))?;
+        // explorer handles both files and directories reliably with spaces.
+        if p.is_dir() {
+            Command::new("explorer")
+                .arg(&expanded)
+                .spawn()
+                .map_err(|e| format!("无法打开：{e}"))?;
+        } else {
+            Command::new("cmd")
+                .args(["/C", "start", "", &expanded])
+                .spawn()
+                .map_err(|e| format!("无法打开：{e}"))?;
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -511,7 +594,7 @@ pub fn open_config_file(config_path: Option<&str>) -> Result<String, String> {
     open_path(&path)
 }
 
-/// Launch interactive Grok in Terminal at cwd, optionally with -m model.
+/// Launch interactive Grok in a platform terminal at cwd, optionally with -m model.
 pub fn launch_grok_terminal(cwd: Option<&str>, model: Option<&str>) -> Result<String, String> {
     let workdir = expand_path(cwd.unwrap_or("~"));
     if !Path::new(&workdir).is_dir() {
@@ -519,52 +602,38 @@ pub fn launch_grok_terminal(cwd: Option<&str>, model: Option<&str>) -> Result<St
     }
 
     let bin = which_grok().ok_or_else(|| "未找到 grok 命令".to_string())?;
-    let mut cmd = format!("cd {} && {}", shell_quote(&workdir), shell_quote(&bin.to_string_lossy()));
+    let mut args: Vec<String> = Vec::new();
     if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-        cmd.push_str(" -m ");
-        cmd.push_str(&shell_quote(m));
+        args.push("-m".into());
+        args.push(m.into());
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        // Open Terminal.app and run the command.
-        let script = format!(
-            "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-            apple_script_string(&cmd)
-        );
-        Command::new("osascript")
-            .args(["-e", &script])
-            .spawn()
-            .map_err(|e| format!("无法启动 Terminal：{e}"))?;
-        return Ok(format!("已在 Terminal 打开 Grok · {workdir}"));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Command::new(&bin)
-            .current_dir(&workdir)
-            .args(model.map(|m| vec!["-m", m]).unwrap_or_default())
-            .spawn()
-            .map_err(|e| format!("无法启动 grok：{e}"))?;
-        Ok(format!("已启动 Grok · {workdir}"))
-    }
+    open_in_terminal(&workdir, &bin, &args)?;
+    Ok(format!("已在终端打开 Grok · {}", short_path(&workdir)))
 }
 
-/// Resume most recent session for a cwd in Terminal.
+/// Resume most recent session for a cwd in a platform terminal.
 pub fn resume_session_terminal(cwd: &str) -> Result<String, String> {
     let workdir = expand_path(cwd);
     if !Path::new(&workdir).is_dir() {
         return Err(format!("工作目录不存在：{workdir}"));
     }
     let bin = which_grok().ok_or_else(|| "未找到 grok 命令".to_string())?;
-    let cmd = format!(
-        "cd {} && {} --continue",
-        shell_quote(&workdir),
-        shell_quote(&bin.to_string_lossy())
-    );
+    open_in_terminal(&workdir, &bin, &["--continue".into()])?;
+    Ok(format!("已继续最近会话 · {}", short_path(&workdir)))
+}
 
+fn open_in_terminal(workdir: &str, bin: &Path, args: &[String]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
+        let mut cmd = format!(
+            "cd {} && {}",
+            shell_quote(workdir),
+            shell_quote(&bin.to_string_lossy())
+        );
+        for a in args {
+            cmd.push(' ');
+            cmd.push_str(&shell_quote(a));
+        }
         let script = format!(
             "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
             apple_script_string(&cmd)
@@ -573,17 +642,67 @@ pub fn resume_session_terminal(cwd: &str) -> Result<String, String> {
             .args(["-e", &script])
             .spawn()
             .map_err(|e| format!("无法启动 Terminal：{e}"))?;
-        return Ok(format!("已继续最近会话 · {}", short_path(&workdir)));
+        return Ok(());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Command::new(&bin)
-            .current_dir(&workdir)
-            .arg("--continue")
+        // Build: "C:\path\grok.exe" -m model
+        let mut parts = vec![win_quote(&bin.to_string_lossy())];
+        for a in args {
+            parts.push(win_quote(a));
+        }
+        let cmdline = parts.join(" ");
+
+        // Prefer Windows Terminal when available. Do NOT silence this process —
+        // the whole point is to show a terminal window.
+        // `wt -d <dir> cmd /K <cmdline>` keeps the window open after exit.
+        if Command::new("wt.exe")
+            .args(["-d", workdir, "cmd.exe", "/K", &cmdline])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // Fallback: new cmd.exe window via `start`.
+        // Title token "Grok" is required so `start` does not treat a quoted path
+        // as the window title.
+        let full = format!("cd /d {} && {}", win_quote(workdir), cmdline);
+        Command::new("cmd.exe")
+            .args(["/C", "start", "Grok", "cmd.exe", "/K", &full])
+            .spawn()
+            .map_err(|e| format!("无法启动终端：{e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut child = Command::new(bin);
+        child.current_dir(workdir).args(args);
+        // Try a few common terminal emulators; fall back to direct spawn.
+        for (term, flag) in [
+            ("x-terminal-emulator", "-e"),
+            ("gnome-terminal", "--"),
+            ("konsole", "-e"),
+            ("xterm", "-e"),
+        ] {
+            let mut line = vec![bin.to_string_lossy().to_string()];
+            line.extend(args.iter().cloned());
+            if Command::new(term)
+                .arg(flag)
+                .args(&line)
+                .current_dir(workdir)
+                .spawn()
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        child
             .spawn()
             .map_err(|e| format!("无法启动 grok：{e}"))?;
-        Ok(format!("已继续最近会话 · {}", short_path(&workdir)))
+        Ok(())
     }
 }
 
@@ -599,6 +718,22 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Quote for cmd.exe: wrap in double quotes; escape embedded `"`.
+/// Always compiled so unit tests can cover Windows quoting on any host.
+#[cfg_attr(not(test), allow(dead_code))]
+fn win_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".into();
+    }
+    if !s
+        .chars()
+        .any(|c| c.is_whitespace() || "^&|<>()%!\"'\\".contains(c))
+    {
+        return s.to_string();
+    }
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 #[cfg(target_os = "macos")]
 fn apple_script_string(s: &str) -> String {
     // AppleScript string literal with escaped quotes and backslashes.
@@ -610,4 +745,58 @@ fn apple_script_string(s: &str) -> String {
 #[allow(dead_code)]
 pub fn count_local_tokens(ids: &[uuid::Uuid]) -> usize {
     ids.iter().filter(|id| secret_store::has_token(**id)).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_unix_and_windows_paths() {
+        assert!(is_absolute_project_path("/Users/kang/proj"));
+        assert!(is_absolute_project_path("C:\\Users\\kang"));
+        assert!(is_absolute_project_path("c:/Users/kang"));
+        assert!(is_absolute_project_path("D:/work"));
+        assert!(!is_absolute_project_path("relative/path"));
+        assert!(!is_absolute_project_path("C:foo")); // drive-relative, not absolute
+        assert!(!is_absolute_project_path(""));
+        assert!(!is_absolute_project_path("~/proj"));
+    }
+
+    #[test]
+    fn decode_percent_encoded_windows_cwd() {
+        let enc = "%43%3A%5CUsers%5Ckang%5CProject";
+        assert_eq!(decode_session_cwd(enc), "C:\\Users\\kang\\Project");
+        assert_eq!(
+            decode_session_cwd("%2FUsers%2Fkang%2FProject"),
+            "/Users/kang/Project"
+        );
+    }
+
+    #[test]
+    fn expand_home_slash_and_backslash() {
+        if let Some(home) = dirs::home_dir() {
+            let h = home.to_string_lossy();
+            assert_eq!(expand_path("~"), h.as_ref());
+            assert!(expand_path("~/a/b").starts_with(h.as_ref()));
+            assert!(expand_path("~\\a\\b").starts_with(h.as_ref()));
+        }
+    }
+
+    #[test]
+    fn win_quote_spaces_and_specials() {
+        assert_eq!(win_quote("grok"), "grok");
+        assert_eq!(win_quote("C:\\Program Files\\grok.exe"), "\"C:\\Program Files\\grok.exe\"");
+        assert_eq!(win_quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(win_quote(""), "\"\"");
+        assert_eq!(win_quote("a&b"), "\"a&b\"");
+    }
+
+    #[test]
+    fn percent_encode_roundtrip_drive_path() {
+        let path = "C:\\Users\\kang\\My Project";
+        let enc = percent_encode_path(path);
+        assert_eq!(decode_session_cwd(&enc), path);
+        assert!(is_absolute_project_path(&decode_session_cwd(&enc)));
+    }
 }

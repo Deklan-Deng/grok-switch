@@ -241,7 +241,7 @@ export function ToolsPanel({ modelId, configPath, onStatus }: Props) {
               }
             >
               <FolderOpen />
-              ~/.grok
+              配置目录
             </Button>
           </div>
         </div>
@@ -418,8 +418,8 @@ export function ToolsPanel({ modelId, configPath, onStatus }: Props) {
           <DialogHeader>
             <DialogTitle>删除会话记录？</DialogTitle>
             <DialogDescription>
-              将删除「{deleteTarget?.cwdLabel}」在 ~/.grok/sessions
-              下的全部会话数据（含历史提问），项目源码不会动。此操作不可撤销。
+              将删除「{deleteTarget?.cwdLabel}」在本机 Grok sessions
+              目录下的全部会话数据（含历史提问），项目源码不会动。此操作不可撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

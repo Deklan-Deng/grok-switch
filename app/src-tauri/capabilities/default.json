@@ -12,6 +12,8 @@
     "core:window:allow-set-focus",
     "core:window:allow-unminimize",
     "core:app:allow-default-window-icon",
-    "opener:default"
+    "opener:default",
+    "updater:default",
+    "process:default"
   ]
 }

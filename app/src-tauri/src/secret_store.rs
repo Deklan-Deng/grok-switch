@@ -1,13 +1,14 @@
 //! Local token vault (CC Switch style).
 //!
 //! Tokens live in the app data directory as a restricted JSON file:
-//!   macOS: ~/Library/Application Support/GrokTokenSwitcher/tokens.json
+//!   macOS:   ~/Library/Application Support/GrokTokenSwitcher/tokens.json
+//!   Windows: %APPDATA%\\GrokTokenSwitcher\\tokens.json
 //!
 //! Directory name kept as `GrokTokenSwitcher` for backward compatibility with
 //! earlier local builds. Display product name is **Grok Switch**.
 //!
-//! On first use we one-shot migrate any leftover Keychain entries (legacy)
-//! so existing users don't lose secrets, then stop using Keychain for new ops.
+//! On macOS, first use one-shot migrates any leftover Keychain entries (legacy)
+//! so existing users don't lose secrets, then stops using Keychain for new ops.
 
 use std::collections::HashMap;
 use std::fs;
@@ -18,6 +19,7 @@ use std::sync::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
 const LEGACY_KEYCHAIN_SERVICE: &str = "local.groktokenswitcher.xai";
 
 #[derive(Debug, Error)]
@@ -100,6 +102,9 @@ fn load_profile_ids_from_disk() -> Option<Vec<String>> {
     Some(ids)
 }
 
+/// Legacy Keychain was only used by early macOS builds. Never touch the platform
+/// credential store on Windows/Linux — tokens live only in the local vault.
+#[cfg(target_os = "macos")]
 fn keychain_load(account: &str) -> Option<String> {
     use keyring::Entry;
     let entry = Entry::new(LEGACY_KEYCHAIN_SERVICE, account).ok()?;
@@ -109,6 +114,7 @@ fn keychain_load(account: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_delete(account: &str) {
     use keyring::Entry;
     if let Ok(entry) = Entry::new(LEGACY_KEYCHAIN_SERVICE, account) {
@@ -117,40 +123,51 @@ fn keychain_delete(account: &str) {
 }
 
 /// One-shot: pull any tokens still in the legacy Keychain into the local vault.
+/// Only meaningful on macOS (legacy builds); other platforms just write the marker.
 fn migrate_from_keychain_once(map: &mut HashMap<String, String>) {
     if migration_marker_path().exists() {
         return;
     }
 
-    let mut ids: Vec<String> = map.keys().cloned().collect();
-    if let Some(profiles) = load_profile_ids_from_disk() {
-        for id in profiles {
-            if !ids.contains(&id) {
-                ids.push(id);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = map;
+        let _ = fs::write(migration_marker_path(), "migrated=0\nplatform=non-macos\n");
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut ids: Vec<String> = map.keys().cloned().collect();
+        if let Some(profiles) = load_profile_ids_from_disk() {
+            for id in profiles {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
             }
         }
-    }
 
-    let mut migrated = 0usize;
-    for id in &ids {
-        if map.get(id).map(|s| !s.is_empty()).unwrap_or(false) {
-            continue;
-        }
-        if let Some(token) = keychain_load(id) {
-            if !token.is_empty() {
-                map.insert(id.clone(), token);
-                migrated += 1;
+        let mut migrated = 0usize;
+        for id in &ids {
+            if map.get(id).map(|s| !s.is_empty()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(token) = keychain_load(id) {
+                if !token.is_empty() {
+                    map.insert(id.clone(), token);
+                    migrated += 1;
+                }
             }
         }
-    }
 
-    // Best-effort delete legacy keychain entries so macOS stops prompting.
-    for id in map.keys().chain(ids.iter()) {
-        keychain_delete(id);
-    }
+        // Best-effort delete legacy keychain entries so macOS stops prompting.
+        for id in map.keys().chain(ids.iter()) {
+            keychain_delete(id);
+        }
 
-    let _ = write_map(map);
-    let _ = fs::write(migration_marker_path(), format!("migrated={migrated}\n"));
+        let _ = write_map(map);
+        let _ = fs::write(migration_marker_path(), format!("migrated={migrated}\n"));
+    }
 }
 
 struct Vault {
@@ -188,6 +205,7 @@ pub fn save_token(id: Uuid, token: &str) -> Result<(), SecretError> {
         } else {
             v.map.insert(key.clone(), token.to_string());
         }
+        #[cfg(target_os = "macos")]
         keychain_delete(&key);
         v.persist()
     })
@@ -201,13 +219,16 @@ pub fn load_token(id: Uuid) -> Result<Option<String>, SecretError> {
                 return Ok(Some(t));
             }
         }
-        // Fallback: promote leftover keychain entry once.
-        if let Some(token) = keychain_load(&key) {
-            if !token.is_empty() {
-                v.map.insert(key.clone(), token.clone());
-                let _ = v.persist();
-                keychain_delete(&key);
-                return Ok(Some(token));
+        // Fallback (macOS only): promote leftover keychain entry once.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(token) = keychain_load(&key) {
+                if !token.is_empty() {
+                    v.map.insert(key.clone(), token.clone());
+                    let _ = v.persist();
+                    keychain_delete(&key);
+                    return Ok(Some(token));
+                }
             }
         }
         Ok(None)
@@ -218,6 +239,7 @@ pub fn delete_token(id: Uuid) -> Result<(), SecretError> {
     with_vault(|v| {
         let key = id.to_string();
         v.map.remove(&key);
+        #[cfg(target_os = "macos")]
         keychain_delete(&key);
         v.persist()
     })

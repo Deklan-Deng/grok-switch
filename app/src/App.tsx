@@ -44,6 +44,7 @@ import {
   ProviderEditor,
 } from "@/components/ProviderEditor";
 import { ToolsPanel } from "@/components/ToolsPanel";
+import { UpdateChecker } from "@/components/UpdateChecker";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -596,15 +597,18 @@ export default function App() {
       </ScrollArea>
 
       <footer className="flex items-center justify-between gap-3 border-t border-border px-5 py-2 text-xs text-muted-foreground">
-        <span className="truncate">{status}</span>
-        <a
-          className="shrink-0 hover:text-foreground"
-          href="https://x.ai/cli"
-          target="_blank"
-          rel="noreferrer"
-        >
-          docs
-        </a>
+        <span className="min-w-0 truncate">{status}</span>
+        <div className="flex shrink-0 items-center gap-2">
+          <UpdateChecker onStatus={setStatus} />
+          <a
+            className="hover:text-foreground"
+            href="https://x.ai/cli"
+            target="_blank"
+            rel="noreferrer"
+          >
+            docs
+          </a>
+        </div>
       </footer>
 
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
@@ -639,7 +643,8 @@ export default function App() {
           <DialogHeader>
             <DialogTitle>从 config.toml 导入？</DialogTitle>
             <DialogDescription>
-              读取 ~/.grok/config.toml 中尚未在列表里的模型段，添加为供应商卡片。不会导入
+              读取本机 Grok 配置（默认 ~/.grok/config.toml，Windows 为
+              %USERPROFILE%\.grok\config.toml）中尚未在列表里的模型段，添加为供应商卡片。不会导入
               API Key，已有同名段名会跳过。
             </DialogDescription>
           </DialogHeader>

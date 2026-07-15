@@ -1056,7 +1056,16 @@ struct GrokOutput {
 }
 
 fn run_grok_models() -> GrokOutput {
-    match Command::new("grok").arg("models").output() {
+    let mut cmd = Command::new("grok");
+    cmd.arg("models");
+    // GUI subsystem apps on Windows flash a console unless CREATE_NO_WINDOW is set.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
         Ok(output) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
             if !output.stderr.is_empty() {

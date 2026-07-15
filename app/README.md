@@ -17,10 +17,13 @@ npm run tauri build
 
 - Frontend: React + TypeScript + Tailwind + shadcn-style UI
 - Backend: Tauri 2 (Rust)
-- Config target: `~/.grok/config.toml` for Grok Build CLI
+- Config target: `~/.grok/config.toml` (Windows: `%USERPROFILE%\.grok\config.toml`)
+- Platforms: macOS 11+ and Windows 10/11 (WebView2)
 
 ## Notes
 
 - New provider form fields start **empty**; xAI strings are **placeholders** only.
 - Default `api_backend` selection: `responses`.
 - Tokens are not written to `config.toml` until you **Enable** a provider.
+- Windows toolbox opens Grok in Windows Terminal when available, else `cmd.exe`.
+- Auto-update via Tauri updater + GitHub Releases `latest.json` (root README).
