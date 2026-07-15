@@ -16,8 +16,12 @@ use tauri::WindowEvent;
 use uuid::Uuid;
 
 #[tauri::command]
-fn get_state(store: tauri::State<'_, Arc<AppStore>>) -> models::CommandResult {
-    store.list_profiles()
+async fn get_state(
+    store: tauri::State<'_, Arc<AppStore>>,
+) -> Result<models::CommandResult, String> {
+    let store = Arc::clone(&store);
+    // Keep even the light list path off the main thread.
+    run_blocking(move || store.list_profiles()).await
 }
 
 #[tauri::command]
@@ -100,7 +104,7 @@ fn save_token(
 }
 
 #[tauri::command]
-fn load_token(
+async fn load_token(
     store: tauri::State<'_, Arc<AppStore>>,
     id: Option<String>,
 ) -> Result<models::CommandResult, String> {
@@ -108,7 +112,9 @@ fn load_token(
         Some(v) => Some(Uuid::parse_str(&v).map_err(|e| e.to_string())?),
         None => None,
     };
-    Ok(store.load_token(id))
+    let store = Arc::clone(&store);
+    // May touch vault / legacy Keychain — keep off the main thread.
+    run_blocking(move || store.load_token(id)).await
 }
 
 #[tauri::command]
@@ -127,14 +133,6 @@ async fn apply_token(
     let result = run_blocking(move || store.apply_token(id, draft_token)).await?;
     refresh_tray_bg(app);
     Ok(result)
-}
-
-#[tauri::command]
-fn restore_backup(
-    store: tauri::State<'_, Arc<AppStore>>,
-    config_path: Option<String>,
-) -> models::CommandResult {
-    store.restore_backup(config_path)
 }
 
 #[tauri::command]
@@ -207,16 +205,11 @@ async fn check_health(
 }
 
 #[tauri::command]
-async fn check_all_health(
+async fn last_health(
     store: tauri::State<'_, Arc<AppStore>>,
 ) -> Result<Vec<health::HealthResult>, String> {
     let store = Arc::clone(&store);
-    run_blocking(move || store.check_all_health()).await
-}
-
-#[tauri::command]
-fn last_health(store: tauri::State<'_, Arc<AppStore>>) -> Vec<health::HealthResult> {
-    store.last_health()
+    run_blocking(move || store.last_health()).await
 }
 
 #[tauri::command]
@@ -235,11 +228,14 @@ fn last_speed_tests(store: tauri::State<'_, Arc<AppStore>>) -> Vec<speedtest::Sp
 }
 
 #[tauri::command]
-fn usage_summary(
+async fn usage_summary(
     store: tauri::State<'_, Arc<AppStore>>,
     window_hours: Option<u32>,
-) -> usage::UsageSummary {
-    store.usage_summary(window_hours)
+    force: Option<bool>,
+) -> Result<usage::UsageSummary, String> {
+    let store = Arc::clone(&store);
+    // Log scan can be multi-MB + JSON parse; keep it off the async runtime.
+    run_blocking(move || store.usage_summary(window_hours, force.unwrap_or(false))).await
 }
 
 #[tauri::command]
@@ -254,7 +250,12 @@ fn doctor(config_path: Option<String>) -> tools::DoctorReport {
 
 #[tauri::command]
 fn list_sessions(limit: Option<usize>) -> Vec<tools::GrokSessionItem> {
-    tools::list_recent_sessions(limit.unwrap_or(12))
+    tools::list_recent_sessions(limit.unwrap_or(30))
+}
+
+#[tauri::command]
+fn delete_session(path: String) -> Result<String, String> {
+    tools::delete_session_project(&path)
 }
 
 #[tauri::command]
@@ -282,23 +283,6 @@ fn resume_session(cwd: String) -> Result<String, String> {
     tools::resume_session_terminal(&cwd)
 }
 
-#[tauri::command]
-fn quick_ask(
-    prompt: String,
-    model: Option<String>,
-    cwd: Option<String>,
-) -> tools::QuickAskResult {
-    tools::quick_ask(&prompt, model.as_deref(), cwd.as_deref())
-}
-
-#[tauri::command]
-fn recipe_commands(
-    model: Option<String>,
-    cwd: Option<String>,
-) -> Vec<(String, String)> {
-    tools::copyable_commands(model.as_deref(), cwd.as_deref())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = Arc::new(AppStore::new());
@@ -310,6 +294,13 @@ pub fn run() {
             if let Err(err) = tray::setup_tray(app.handle(), store.clone()) {
                 eprintln!("tray setup failed: {err}");
             }
+            // Warm usage cache + tray line in the background — never on the UI thread.
+            let warm_store = store.clone();
+            let warm_app = app.handle().clone();
+            std::thread::spawn(move || {
+                let _ = warm_store.usage_summary(Some(24), false);
+                tray::refresh_tray(&warm_app);
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -331,14 +322,12 @@ pub fn run() {
             save_token,
             load_token,
             apply_token,
-            restore_backup,
             read_config_file,
             write_config_file,
             refresh_config,
             verify_grok,
             test_connectivity,
             check_health,
-            check_all_health,
             last_health,
             run_speed_test,
             last_speed_tests,
@@ -346,13 +335,12 @@ pub fn run() {
             fetch_available_models,
             doctor,
             list_sessions,
+            delete_session,
             open_path,
             open_config_dir,
             open_config_file,
             launch_grok,
-            resume_session,
-            quick_ask,
-            recipe_commands
+            resume_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

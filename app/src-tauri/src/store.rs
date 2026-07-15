@@ -2,12 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config_toml::{
-    backup_path, build_preview, expand_path, parse_grok_config, upsert_model_config, ModelUpsert,
+    build_preview, expand_path, parse_grok_config, upsert_model_config, ModelUpsert,
 };
 use crate::health::{self, HealthResult};
 use crate::models::{AppState, CommandResult, ConfigSnapshot, CreateProviderInput, TokenProfile};
@@ -19,6 +20,9 @@ pub struct AppStore {
     inner: Mutex<Inner>,
 }
 
+/// Reuse usage scans across tray rebuilds / window reopens for a short window.
+const USAGE_CACHE_TTL: Duration = Duration::from_secs(45);
+
 struct Inner {
     state: AppState,
     discovered: ConfigSnapshot,
@@ -29,6 +33,8 @@ struct Inner {
     health: std::collections::HashMap<uuid::Uuid, HealthResult>,
     /// Last speed test per profile id.
     speed: std::collections::HashMap<uuid::Uuid, SpeedTestResult>,
+    /// Cached usage summary: (window_hours, computed_at, summary).
+    usage_cache: Option<(u32, Instant, UsageSummary)>,
 }
 
 impl AppStore {
@@ -50,13 +56,15 @@ impl AppStore {
                 busy: false,
                 health: std::collections::HashMap::new(),
                 speed: std::collections::HashMap::new(),
+                usage_cache: None,
             }),
         }
     }
 
     pub fn snapshot(&self) -> CommandResult {
+        // Light path: list UI must never block on config reads / vault re-scans.
         let guard = self.inner.lock().expect("store lock");
-        guard.to_result(None)
+        guard.to_list_result()
     }
 
     pub fn list_profiles(&self) -> CommandResult {
@@ -376,19 +384,10 @@ impl AppStore {
             }
         }
 
-        if let Ok(existing) = fs::read_to_string(&expanded) {
-            if !existing.is_empty() {
-                if let Err(err) = fs::write(backup_path(&expanded), &existing) {
-                    guard.status = format!("备份失败：{err}");
-                    return guard.to_result(None);
-                }
-            }
-        }
-
         match fs::write(&expanded, &content) {
             Ok(()) => {
                 guard.discovered = parse_grok_config(&content);
-                guard.status = "已保存完整 config.toml（已备份上一版）。".into();
+                guard.status = "已保存完整 config.toml。".into();
                 let mut result = guard.to_result(None);
                 result.config_text = Some(content);
                 result.config_path = Some(expanded);
@@ -426,17 +425,29 @@ impl AppStore {
     }
 
     pub fn load_token(&self, id: Option<Uuid>) -> CommandResult {
-        let mut guard = self.inner.lock().expect("store lock");
-        let Some(id) = id.or(guard.state.selected_id) else {
-            guard.status = "没有选中的配置档。".into();
-            return guard.to_result(None);
+        let id = {
+            let guard = self.inner.lock().expect("store lock");
+            match id.or(guard.state.selected_id) {
+                Some(id) => id,
+                None => {
+                    // Need mutable for status — re-lock briefly.
+                    drop(guard);
+                    let mut g = self.inner.lock().expect("store lock");
+                    g.status = "没有选中的配置档。".into();
+                    return g.to_result(None);
+                }
+            }
         };
-        match secret_store::load_token(id) {
+
+        // Vault / Keychain outside the store mutex.
+        let loaded = secret_store::load_token(id);
+
+        let mut guard = self.inner.lock().expect("store lock");
+        match loaded {
             Ok(Some(token)) if !token.is_empty() => {
                 if let Some(profile) = guard.state.profiles.iter_mut().find(|p| p.id == id) {
                     profile.token_saved = Some(true);
                 }
-                persist(&guard.state);
                 guard.status = "已读取本地 Token。".into();
                 guard.to_result(Some(token))
             }
@@ -444,7 +455,6 @@ impl AppStore {
                 if let Some(profile) = guard.state.profiles.iter_mut().find(|p| p.id == id) {
                     profile.token_saved = Some(false);
                 }
-                persist(&guard.state);
                 guard.status = "本地没有此供应商的 Token。".into();
                 guard.to_result(Some(String::new()))
             }
@@ -500,14 +510,6 @@ impl AppStore {
         }
 
         let existing = fs::read_to_string(&path).unwrap_or_default();
-        if !existing.is_empty() {
-            if let Err(err) = fs::write(backup_path(&path), &existing) {
-                let mut guard = self.inner.lock().expect("store lock");
-                guard.status = format!("备份失败：{err}");
-                return guard.to_result(None);
-            }
-        }
-
         let upsert = model_upsert_from_profile(&profile, Some(token.clone()));
         let content = upsert_model_config(&existing, &upsert);
         let write_result = fs::write(&path, content);
@@ -543,30 +545,6 @@ impl AppStore {
                 );
             }
             Err(err) => guard.status = format!("写入失败：{err}"),
-        }
-        guard.to_result(None)
-    }
-
-    pub fn restore_backup(&self, config_path: Option<String>) -> CommandResult {
-        let mut guard = self.inner.lock().expect("store lock");
-        let path = config_path
-            .or_else(|| {
-                guard
-                    .selected()
-                    .map(|p| p.config_path.clone())
-            })
-            .unwrap_or_else(default_config_path);
-        let path = expand_path(&path);
-        let backup = backup_path(&path);
-        match fs::read_to_string(&backup) {
-            Ok(content) => match fs::write(&path, content) {
-                Ok(()) => {
-                    guard.discovered = read_config_snapshot(&path);
-                    guard.status = "已恢复上一次应用前的配置。".into();
-                }
-                Err(err) => guard.status = format!("恢复失败：{err}"),
-            },
-            Err(_) => guard.status = "没有可恢复的备份。".into(),
         }
         guard.to_result(None)
     }
@@ -616,9 +594,10 @@ impl AppStore {
 
     /// Structured health check with explainable failure categories.
     pub fn check_health(&self, id: Uuid) -> HealthResult {
-        let (name, base_url, token) = {
-            let mut guard = self.inner.lock().expect("store lock");
-            let Some(profile) = guard.state.profiles.iter().find(|p| p.id == id).cloned() else {
+        // 1) Snapshot profile under lock (no I/O).
+        let (name, base_url) = {
+            let guard = self.inner.lock().expect("store lock");
+            let Some(profile) = guard.state.profiles.iter().find(|p| p.id == id) else {
                 return HealthResult {
                     profile_id: id.to_string(),
                     name: "未知".into(),
@@ -633,24 +612,32 @@ impl AppStore {
                     checked_at: 0,
                 };
             };
-            let token = secret_store::load_token(id)
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if let Some(p) = guard.state.profiles.iter_mut().find(|p| p.id == id) {
-                p.token_saved = Some(!token.is_empty());
-            }
-            persist(&guard.state);
-            guard.status = format!("正在检查「{}」健康度…", profile.name);
-            (
-                profile.name,
-                profile.base_url.clone(),
-                if token.is_empty() { None } else { Some(token) },
-            )
+            (profile.name.clone(), profile.base_url.clone())
         };
 
+        // 2) Vault I/O outside store lock — never block list/get_state.
+        let token = secret_store::load_token(id)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let token = if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        };
+
+        {
+            let mut guard = self.inner.lock().expect("store lock");
+            if let Some(p) = guard.state.profiles.iter_mut().find(|p| p.id == id) {
+                p.token_saved = Some(token.is_some());
+            }
+            // No persist here: token_saved is a derived badge, not durable state.
+            guard.status = format!("正在检查「{}」健康度…", name);
+        }
+
+        // 3) Network completely unlocked.
         let result = health::check_provider(
             &id.to_string(),
             &name,
@@ -664,38 +651,6 @@ impl AppStore {
         result
     }
 
-    pub fn check_all_health(&self) -> Vec<HealthResult> {
-        let ids: Vec<Uuid> = {
-            let guard = self.inner.lock().expect("store lock");
-            guard.state.profiles.iter().map(|p| p.id).collect()
-        };
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        // Parallel probes: network dominates; store mutex is only held briefly per profile.
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(ids.len());
-            for id in ids {
-                handles.push(scope.spawn(move || self.check_health(id)));
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| HealthResult {
-                    profile_id: String::new(),
-                    name: "未知".into(),
-                    ok: false,
-                    category: "unknown".into(),
-                    title: "体检线程异常".into(),
-                    detail: "后台线程失败".into(),
-                    hint: "重试批量体检。".into(),
-                    latency_ms: None,
-                    status_code: None,
-                    url: None,
-                    checked_at: 0,
-                }))
-                .collect()
-        })
-    }
 
     pub fn last_health(&self) -> Vec<HealthResult> {
         let guard = self.inner.lock().expect("store lock");
@@ -775,8 +730,34 @@ impl AppStore {
         out
     }
 
-    pub fn usage_summary(&self, window_hours: Option<u32>) -> UsageSummary {
-        usage::summarize_usage(window_hours.unwrap_or(24))
+    /// Summarize local Grok logs. Uses a short TTL cache unless `force`.
+    pub fn usage_summary(&self, window_hours: Option<u32>, force: bool) -> UsageSummary {
+        let hours = window_hours.unwrap_or(24).clamp(1, 24 * 30);
+        if !force {
+            if let Ok(guard) = self.inner.lock() {
+                if let Some((cached_hours, at, ref summary)) = &guard.usage_cache {
+                    if *cached_hours == hours && at.elapsed() < USAGE_CACHE_TTL {
+                        return summary.clone();
+                    }
+                }
+            }
+        }
+
+        let summary = usage::summarize_usage(hours);
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.usage_cache = Some((hours, Instant::now(), summary.clone()));
+        }
+        summary
+    }
+
+    /// Return cached usage only — never scans logs. Safe for tray / main thread.
+    pub fn usage_cached(&self, window_hours: Option<u32>) -> Option<UsageSummary> {
+        let hours = window_hours.unwrap_or(24).clamp(1, 24 * 30);
+        let guard = self.inner.lock().ok()?;
+        match &guard.usage_cache {
+            Some((cached_hours, _at, summary)) if *cached_hours == hours => Some(summary.clone()),
+            _ => None,
+        }
     }
 
     pub fn verify_grok(&self) -> CommandResult {
@@ -906,8 +887,27 @@ impl Inner {
             .unwrap_or_else(default_config_path)
     }
 
+    /// Fast path for the main list / tray — no config file read, no vault re-walk.
+    fn to_list_result(&self) -> CommandResult {
+        let path = expand_path(&self.resolved_config_path());
+        CommandResult {
+            status: self.status.clone(),
+            profiles: self.state.profiles.clone(),
+            selected_id: self.state.selected_id,
+            current_id: self.state.current_id,
+            discovered_models: self.discovered.models.clone(),
+            default_model_id: self.discovered.default_model_id.clone(),
+            available_model_ids: self.available_model_ids.clone(),
+            preview: None,
+            token: None,
+            config_text: None,
+            config_path: Some(path),
+            busy: self.busy,
+        }
+    }
+
     fn to_result(&self, token: Option<String>) -> CommandResult {
-        // Always re-check local vault so the "密钥 / 无密钥" badge cannot drift.
+        // Refresh key badges from the in-memory vault only (never Keychain).
         let mut profiles = self.state.profiles.clone();
         for profile in &mut profiles {
             profile.token_saved = Some(secret_store::has_token(profile.id));
@@ -918,7 +918,8 @@ impl Inner {
             build_preview(&profile.config_path, &upsert, &self.discovered)
         });
         let path = expand_path(&self.resolved_config_path());
-        let config_text = fs::read_to_string(&path).ok();
+        // config_text is heavy and only needed by the raw editor — omit by default.
+        // Callers that need it use read_config_file.
 
         CommandResult {
             status: self.status.clone(),
@@ -930,7 +931,7 @@ impl Inner {
             available_model_ids: self.available_model_ids.clone(),
             preview,
             token,
-            config_text,
+            config_text: None,
             config_path: Some(path),
             busy: self.busy,
         }

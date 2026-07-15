@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowLeft, Eye, EyeOff, Save, Zap } from "lucide-react";
 import type { TokenProfile } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -35,6 +36,28 @@ export type EditorForm = {
   setAsDefault: boolean;
   token: string;
 };
+
+/**
+ * Derive config.toml section key from a local display name.
+ * Prefers ascii [a-z0-9_-]; falls back to trimmed name (quoted by backend if needed).
+ */
+export function slugModelId(name: string): string {
+  const t = name.trim();
+  if (!t) return "";
+  const ascii = t
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (ascii) return ascii;
+  return t.replace(/\s+/g, "-");
+}
+
+/** Resolve modelId for save: explicit value, else slug of name. */
+export function resolveModelId(form: Pick<EditorForm, "name" | "modelId">): string {
+  const explicit = form.modelId.trim();
+  if (explicit) return explicit;
+  return slugModelId(form.name);
+}
 
 export function profileToForm(profile: TokenProfile, token = ""): EditorForm {
   return {
@@ -96,19 +119,39 @@ export function ProviderEditor({
 }: Props) {
   const [form, setForm] = useState<EditorForm>(initial);
   const [reveal, setReveal] = useState(false);
+  /** Create mode: user overrode auto section id from name. */
+  const [modelIdTouched, setModelIdTouched] = useState(false);
+  const [showSectionId, setShowSectionId] = useState(mode === "edit");
 
   useEffect(() => {
     setForm(initial);
     setReveal(false);
-  }, [initial]);
+    setModelIdTouched(false);
+    setShowSectionId(mode === "edit");
+  }, [initial, mode]);
 
   const patch = (partial: Partial<EditorForm>) =>
     setForm((prev) => ({ ...prev, ...partial }));
 
+  const onNameChange = (name: string) => {
+    setForm((prev) => {
+      if (mode === "create" && !modelIdTouched) {
+        return { ...prev, name, modelId: slugModelId(name) };
+      }
+      return { ...prev, name };
+    });
+  };
+
+  const effectiveModelId = resolveModelId(form);
   const canSave =
     form.name.trim().length > 0 &&
-    form.modelId.trim().length > 0 &&
+    effectiveModelId.length > 0 &&
     (mode === "edit" || form.token.trim().length > 0);
+
+  const withResolvedId = (f: EditorForm): EditorForm => ({
+    ...f,
+    modelId: resolveModelId(f),
+  });
 
   return (
     <div className="w-full">
@@ -118,26 +161,26 @@ export function ProviderEditor({
             <Button variant="ghost" size="icon" className="h-8 w-8" onClick={onBack}>
               <ArrowLeft />
             </Button>
-            <div className="min-w-0">
-              <h1 className="truncate text-sm font-medium tracking-tight">{title}</h1>
-              <p className="text-[11px] text-muted-foreground">
-                [model.&lt;id&gt;] 字段
-              </p>
-            </div>
+            <h1 className="truncate text-sm font-medium tracking-tight">{title}</h1>
           </div>
-          <div className="flex shrink-0 gap-1.5">
+          <div className="flex shrink-0 items-center gap-1.5">
+            <ThemeToggle />
             {mode === "edit" && onEnable && !isCurrent ? (
               <Button
                 variant="secondary"
                 size="sm"
                 disabled={busy || !canSave}
-                onClick={() => void onEnable(form)}
+                onClick={() => void onEnable(withResolvedId(form))}
               >
                 <Zap />
                 保存并启用
               </Button>
             ) : null}
-            <Button size="sm" disabled={busy || !canSave} onClick={() => void onSave(form)}>
+            <Button
+              size="sm"
+              disabled={busy || !canSave}
+              onClick={() => void onSave(withResolvedId(form))}
+            >
               <Save />
               {mode === "create" ? "添加备用" : "保存"}
             </Button>
@@ -149,37 +192,50 @@ export function ProviderEditor({
       <section className="space-y-3 rounded-lg border border-border bg-card p-4">
         <h2 className="text-xs font-medium text-muted-foreground">供应商</h2>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <Field label="本地名称" hint="App 卡片上显示">
+          <Field label="本地名称">
             <Input
               value={form.name}
-              onChange={(e) => patch({ name: e.target.value })}
+              onChange={(e) => onNameChange(e.target.value)}
               placeholder="xAI Grok"
             />
           </Field>
-          <Field
-            label="模型 ID（section）"
-            hint="写入 config 的 [model.xai-grok] 段名"
-          >
-            <Input
-              value={form.modelId}
-              onChange={(e) => patch({ modelId: e.target.value })}
-              placeholder="xai-grok"
-            />
-          </Field>
+          {mode === "create" && !showSectionId ? (
+            <div className="flex min-w-0 items-end">
+              <button
+                type="button"
+                className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                onClick={() => setShowSectionId(true)}
+              >
+                自定义段名
+                {effectiveModelId ? ` · ${effectiveModelId}` : ""}
+              </button>
+            </div>
+          ) : (
+            <Field label="段名">
+              <Input
+                value={form.modelId}
+                onChange={(e) => {
+                  setModelIdTouched(true);
+                  patch({ modelId: e.target.value });
+                }}
+                placeholder={mode === "create" ? slugModelId(form.name) || "xai-grok" : "xai-grok"}
+              />
+            </Field>
+          )}
         </div>
       </section>
 
       <section className="space-y-3 rounded-lg border border-border bg-card p-4">
-        <h2 className="text-xs font-medium text-muted-foreground">模型段</h2>
+        <h2 className="text-xs font-medium text-muted-foreground">模型</h2>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <Field label="model" hint="发给 API 的模型名，如 grok-4.5">
+          <Field label="model">
             <Input
               value={form.apiModel}
               onChange={(e) => patch({ apiModel: e.target.value })}
               placeholder="grok-4.5"
             />
           </Field>
-          <Field label="name" hint="Grok 模型选择器里的显示名">
+          <Field label="name">
             <Input
               value={form.modelAlias}
               onChange={(e) => patch({ modelAlias: e.target.value })}
@@ -196,7 +252,7 @@ export function ProviderEditor({
             </Field>
           </div>
           <div className="md:col-span-2">
-            <Field label="base_url" hint="官方或 OpenAI 兼容端点">
+            <Field label="base_url">
               <Input
                 value={form.baseUrl}
                 onChange={(e) => patch({ baseUrl: e.target.value })}
@@ -204,14 +260,7 @@ export function ProviderEditor({
               />
             </Field>
           </div>
-          <Field
-            label="api_key / Token"
-            hint={
-              isCurrent
-                ? "保存会立即写入 config.toml"
-                : "先保存在本地；点「保存并启用」时才写入 config.toml"
-            }
-          >
+          <Field label="api_key">
             <div className="relative">
               <Input
                 type={reveal ? "text" : "password"}
@@ -219,7 +268,7 @@ export function ProviderEditor({
                 className="pr-12"
                 autoComplete="off"
                 spellCheck={false}
-                placeholder={mode === "edit" ? "留空则保持本地已存的值" : "sk-..."}
+                placeholder={mode === "edit" ? "留空保持不变" : "sk-..."}
                 onChange={(e) => patch({ token: e.target.value })}
               />
               <Button
@@ -233,14 +282,14 @@ export function ProviderEditor({
               </Button>
             </div>
           </Field>
-          <Field label="env_key" hint="如 XAI_API_KEY；有 api_key 时优先用 api_key">
+          <Field label="env_key">
             <Input
               value={form.envKey}
               onChange={(e) => patch({ envKey: e.target.value })}
               placeholder="XAI_API_KEY"
             />
           </Field>
-          <Field label="api_backend" hint="官方 xAI 推荐 responses">
+          <Field label="api_backend">
             <Select
               value={form.apiBackend || "responses"}
               onValueChange={(v) => patch({ apiBackend: v })}
@@ -257,7 +306,7 @@ export function ProviderEditor({
               </SelectContent>
             </Select>
           </Field>
-          <Field label="context_window" hint="用于 auto-compact 阈值">
+          <Field label="context_window">
             <Input
               inputMode="numeric"
               value={form.contextWindow}
@@ -275,19 +324,16 @@ export function ProviderEditor({
           </Field>
         </div>
 
-        <label className="flex items-center gap-2.5 text-sm text-muted-foreground">
+        <label className="flex items-center gap-2.5 text-sm">
           <Checkbox
             checked={form.setAsDefault}
             onCheckedChange={(c) => patch({ setAsDefault: c === true })}
           />
-          <span>
-            启用时写入 <code className="font-mono text-[11px]">[models] default</code>
-          </span>
+          <span>设为默认模型</span>
         </label>
       </section>
 
       <section className="space-y-3 rounded-lg border border-border bg-card p-4">
-        <h2 className="text-xs font-medium text-muted-foreground">其它</h2>
         <Field label="config 路径">
           <Input
             value={form.configPath}
@@ -319,12 +365,9 @@ export function ConfigRawEditor({
   return (
     <section className="mx-auto w-full max-w-3xl space-y-2 px-5 pb-8">
       <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="text-xs font-medium text-muted-foreground">config.toml</h2>
-          <p className="truncate text-[11px] text-muted-foreground">
-            {path || "~/.grok/config.toml"}
-          </p>
-        </div>
+        <h2 className="min-w-0 truncate text-sm font-medium" title={path || undefined}>
+          {path || "config.toml"}
+        </h2>
         <div className="flex gap-1.5">
           <Button variant="ghost" size="sm" disabled={busy} onClick={onReload}>
             重新加载
@@ -342,27 +385,21 @@ export function ConfigRawEditor({
         className="min-h-[320px] font-mono text-xs leading-relaxed"
         placeholder="# ~/.grok/config.toml"
       />
-      <p className="text-[11px] text-muted-foreground">
-        保存前自动备份 · 文件中含明文 api_key
-      </p>
     </section>
   );
 }
 
 function Field({
   label,
-  hint,
   children,
 }: {
   label: string;
-  hint?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       <Label>{label}</Label>
       {children}
-      {hint ? <p className="text-[11px] leading-relaxed text-muted-foreground">{hint}</p> : null}
     </div>
   );
 }

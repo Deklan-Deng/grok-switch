@@ -223,6 +223,14 @@ pub fn delete_token(id: Uuid) -> Result<(), SecretError> {
     })
 }
 
+/// Fast vault-only presence check. Never touches Keychain (Keychain I/O on the
+/// UI thread freezes macOS apps for seconds).
 pub fn has_token(id: Uuid) -> bool {
-    matches!(load_token(id), Ok(Some(v)) if !v.is_empty())
+    with_vault(|v| {
+        Ok(v.map
+            .get(&id.to_string())
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false))
+    })
+    .unwrap_or(false)
 }

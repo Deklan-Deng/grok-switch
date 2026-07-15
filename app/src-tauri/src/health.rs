@@ -97,7 +97,9 @@ pub fn check_provider(
     let token = token.unwrap();
 
     let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
+        // Keep probes bounded: a hung third-party host must not stall the app for long.
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(6))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
     {

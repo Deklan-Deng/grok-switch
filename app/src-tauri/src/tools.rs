@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,15 +36,16 @@ pub struct GrokSessionItem {
     pub path: String,
     pub updated_at: i64,
     pub last_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuickAskResult {
-    pub ok: bool,
-    pub command: String,
-    pub output: String,
-    pub elapsed_ms: u128,
+    /// Session title from latest summary.json when available.
+    pub title: Option<String>,
+    /// Last model id recorded in summary.json.
+    pub model_id: Option<String>,
+    /// Number of session subdirectories under this project.
+    pub session_count: u32,
+    /// Lines in project-level prompt_history.jsonl.
+    pub prompt_count: u32,
+    /// Whether the project directory still exists on disk.
+    pub path_exists: bool,
 }
 
 fn home_grok_dir() -> PathBuf {
@@ -143,9 +144,21 @@ fn file_mtime_ms(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-fn last_prompt_from_history(history: &Path) -> Option<String> {
-    let text = fs::read_to_string(history).ok()?;
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    } else {
+        s.to_string()
+    }
+}
+
+fn last_prompt_and_count(history: &Path) -> (Option<String>, u32) {
+    let Ok(text) = fs::read_to_string(history) else {
+        return (None, 0);
+    };
     let mut last: Option<String> = None;
+    let mut count = 0u32;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -155,19 +168,68 @@ fn last_prompt_from_history(history: &Path) -> Option<String> {
             if let Some(p) = v.get("prompt").and_then(|x| x.as_str()) {
                 let cleaned = p.replace('\n', " ").trim().to_string();
                 if !cleaned.is_empty() {
-                    last = Some(cleaned);
+                    count += 1;
+                    last = Some(truncate_chars(&cleaned, 160));
                 }
             }
         }
     }
-    last.map(|s| {
-        if s.chars().count() > 120 {
-            let cut: String = s.chars().take(120).collect();
-            format!("{cut}…")
-        } else {
-            s
+    (last, count)
+}
+
+/// Read title + model from the newest session summary under a project dir.
+fn latest_session_meta(project_dir: &Path) -> (Option<String>, Option<String>, Option<String>, u32) {
+    let Ok(rd) = fs::read_dir(project_dir) else {
+        return (None, None, None, 0);
+    };
+    let mut best_time: i64 = -1;
+    let mut best_id: Option<String> = None;
+    let mut session_count = 0u32;
+
+    for sub in rd.flatten() {
+        let sp = sub.path();
+        if !sp.is_dir() {
+            continue;
         }
-    })
+        let name = sub.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Grok session ids look like ULIDs / long hex.
+        if !(name.starts_with("019") || name.len() > 20) {
+            continue;
+        }
+        session_count += 1;
+        let mt = file_mtime_ms(&sp);
+        if mt >= best_time {
+            best_time = mt;
+            best_id = Some(name);
+        }
+    }
+
+    let Some(id) = best_id else {
+        return (None, None, None, session_count);
+    };
+
+    let summary_path = project_dir.join(&id).join("summary.json");
+    let mut title = None;
+    let mut model_id = None;
+    if let Ok(text) = fs::read_to_string(&summary_path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            title = v
+                .get("generated_title")
+                .and_then(|x| x.as_str())
+                .or_else(|| v.get("session_summary").and_then(|x| x.as_str()))
+                .map(|s| truncate_chars(s.trim(), 80))
+                .filter(|s| !s.is_empty());
+            model_id = v
+                .get("current_model_id")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    (Some(id), title, model_id, session_count)
 }
 
 pub fn doctor(config_path: Option<&str>) -> DoctorReport {
@@ -303,11 +365,8 @@ pub fn list_recent_sessions(limit: usize) -> Vec<GrokSessionItem> {
             continue;
         }
         let encoded = entry.file_name().to_string_lossy().into_owned();
-        if !encoded.starts_with('%') && !encoded.contains("%2F") {
-            // Still allow non-encoded names, but skip lock files etc.
-            if encoded.starts_with('.') {
-                continue;
-            }
+        if encoded.starts_with('.') {
+            continue;
         }
         let cwd = decode_session_cwd(&encoded);
         if cwd.is_empty() || !cwd.starts_with('/') {
@@ -315,48 +374,100 @@ pub fn list_recent_sessions(limit: usize) -> Vec<GrokSessionItem> {
         }
 
         let history = path.join("prompt_history.jsonl");
+        let (last_prompt, prompt_count) = last_prompt_and_count(&history);
+        let (session_id, title, model_id, session_count) = latest_session_meta(&path);
+
         let updated = if history.exists() {
             file_mtime_ms(&history)
         } else {
             file_mtime_ms(&path)
         };
 
-        // Find newest session subdir id if present.
-        let mut session_id = encoded.clone();
-        if let Ok(rd) = fs::read_dir(&path) {
-            let mut best_time: i64 = -1;
-            let mut best_id: Option<String> = None;
-            for sub in rd.flatten() {
-                let sp = sub.path();
-                if sp.is_dir() {
-                    let name = sub.file_name().to_string_lossy().into_owned();
-                    if name.starts_with("019") || name.len() > 20 {
-                        let mt = file_mtime_ms(&sp);
-                        if mt >= best_time {
-                            best_time = mt;
-                            best_id = Some(name);
-                        }
-                    }
-                }
-            }
-            if let Some(id) = best_id {
-                session_id = id;
-            }
-        }
-
         items.push(GrokSessionItem {
-            id: session_id,
+            id: session_id.unwrap_or(encoded),
             cwd: cwd.clone(),
             cwd_label: short_path(&cwd),
             path: path.to_string_lossy().into_owned(),
             updated_at: updated,
-            last_prompt: last_prompt_from_history(&history),
+            last_prompt,
+            title,
+            model_id,
+            session_count,
+            prompt_count,
+            path_exists: Path::new(&cwd).is_dir(),
         });
     }
 
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     items.truncate(limit.max(1));
     items
+}
+
+/// Delete a project session folder under `~/.grok/sessions/`.
+/// Accepts either the absolute project cwd or the sessions storage path.
+pub fn delete_session_project(path_or_cwd: &str) -> Result<String, String> {
+    let raw = path_or_cwd.trim();
+    if raw.is_empty() {
+        return Err("路径为空".into());
+    }
+
+    let root = home_grok_dir().join("sessions");
+    let root_canon = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.clone());
+
+    let candidate = {
+        let p = PathBuf::from(raw);
+        if p.is_dir() && p.starts_with(&root) {
+            p
+        } else {
+            // Encode cwd the same way Grok stores sessions: percent-encode path.
+            let cwd = expand_path(raw);
+            let encoded = percent_encode_path(&cwd);
+            root.join(encoded)
+        }
+    };
+
+    if !candidate.exists() {
+        return Err(format!("会话目录不存在：{}", candidate.display()));
+    }
+
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| format!("无法解析路径：{e}"))?;
+    if !canon.starts_with(&root_canon) {
+        return Err("只能删除 ~/.grok/sessions 下的会话目录".into());
+    }
+    if canon == root_canon {
+        return Err("不能删除 sessions 根目录".into());
+    }
+
+    let label = {
+        let name = canon
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let cwd = decode_session_cwd(&name);
+        if cwd.starts_with('/') {
+            short_path(&cwd)
+        } else {
+            short_path(&name)
+        }
+    };
+
+    fs::remove_dir_all(&canon).map_err(|e| format!("删除失败：{e}"))?;
+    Ok(format!("已删除会话 · {label}"))
+}
+
+fn percent_encode_path(path: &str) -> String {
+    path.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 pub fn open_path(path: &str) -> Result<String, String> {
@@ -474,112 +585,6 @@ pub fn resume_session_terminal(cwd: &str) -> Result<String, String> {
             .map_err(|e| format!("无法启动 grok：{e}"))?;
         Ok(format!("已继续最近会话 · {}", short_path(&workdir)))
     }
-}
-
-/// One-shot ask via `grok -p` (headless).
-pub fn quick_ask(prompt: &str, model: Option<&str>, cwd: Option<&str>) -> QuickAskResult {
-    let prompt = prompt.trim();
-    let workdir = expand_path(cwd.unwrap_or("~"));
-    let bin = match which_grok() {
-        Some(b) => b,
-        None => {
-            return QuickAskResult {
-                ok: false,
-                command: "grok -p …".into(),
-                output: "未找到 grok 命令".into(),
-                elapsed_ms: 0,
-            };
-        }
-    };
-
-    let mut args: Vec<String> = vec!["-p".into(), prompt.into()];
-    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("-m".into());
-        args.push(m.into());
-    }
-
-    let command = format!(
-        "{} {}",
-        bin.file_name().and_then(|s| s.to_str()).unwrap_or("grok"),
-        args.iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-
-    let started = SystemTime::now();
-    let output = Command::new(&bin)
-        .args(&args)
-        .current_dir(&workdir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-
-    let elapsed_ms = started
-        .elapsed()
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    match output {
-        Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-            if !o.stderr.is_empty() {
-                if !text.is_empty() {
-                    text.push_str("\n\n");
-                }
-                text.push_str(&String::from_utf8_lossy(&o.stderr));
-            }
-            if text.trim().is_empty() {
-                text = if o.status.success() {
-                    "(无输出)".into()
-                } else {
-                    format!("命令失败，退出码 {:?}", o.status.code())
-                };
-            }
-            QuickAskResult {
-                ok: o.status.success(),
-                command,
-                output: text,
-                elapsed_ms,
-            }
-        }
-        Err(e) => QuickAskResult {
-            ok: false,
-            command,
-            output: format!("无法启动 grok：{e}"),
-            elapsed_ms,
-        },
-    }
-}
-
-pub fn copyable_commands(model: Option<&str>, cwd: Option<&str>) -> Vec<(String, String)> {
-    let workdir = expand_path(cwd.unwrap_or("~"));
-    let m = model.unwrap_or("").trim();
-    let model_flag = if m.is_empty() {
-        String::new()
-    } else {
-        format!(" -m {m}")
-    };
-    vec![
-        (
-            "交互式启动".into(),
-            format!("cd {} && grok{}", shell_quote(&workdir), model_flag),
-        ),
-        (
-            "继续最近会话".into(),
-            format!("cd {} && grok --continue", shell_quote(&workdir)),
-        ),
-        (
-            "一次性提问".into(),
-            format!(
-                "cd {} && grok -p \"你的问题\"{}",
-                shell_quote(&workdir),
-                model_flag
-            ),
-        ),
-        ("查看模型列表".into(), "grok models".into()),
-        ("登录".into(), "grok login".into()),
-    ]
 }
 
 fn shell_quote(s: &str) -> String {

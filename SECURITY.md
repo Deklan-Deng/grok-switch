@@ -9,7 +9,6 @@ Grok Switch is a **local desktop utility**. It does not run a cloud backend and 
 | Provider list / settings | `~/Library/Application Support/GrokTokenSwitcher/profiles.json` | No API keys in normal flow |
 | API tokens | `~/Library/Application Support/GrokTokenSwitcher/tokens.json` | Local file, restricted permissions when written |
 | Active Grok CLI config | `~/.grok/config.toml` | Written **only when you enable** a provider |
-| Config backups | next to `config.toml` (`.grok-switch-backup` suffix) | Created before overwrite |
 
 Legacy Keychain entries (if any from older builds) may be migrated once into the local token vault.
 

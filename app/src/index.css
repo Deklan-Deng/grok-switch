@@ -30,7 +30,8 @@
   --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
 }
 
-/* Flat, neutral palette — almost monochrome */
+/* Flat, neutral palette — almost monochrome.
+   Controlled by `.dark` on <html> (see lib/theme.ts), not OS media alone. */
 :root {
   --radius: 0.5rem;
   --background: #f7f7f7;
@@ -51,29 +52,29 @@
   --border: #e5e5e5;
   --input: #e5e5e5;
   --ring: #a3a3a3;
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0c0c0c;
-    --foreground: #f5f5f5;
-    --card: #141414;
-    --card-foreground: #f5f5f5;
-    --popover: #141414;
-    --popover-foreground: #f5f5f5;
-    --primary: #f5f5f5;
-    --primary-foreground: #0c0c0c;
-    --secondary: #1c1c1c;
-    --secondary-foreground: #f5f5f5;
-    --muted: #1c1c1c;
-    --muted-foreground: #a3a3a3;
-    --accent: #1c1c1c;
-    --accent-foreground: #f5f5f5;
-    --destructive: #ef4444;
-    --border: #262626;
-    --input: #262626;
-    --ring: #525252;
-  }
+html.dark {
+  --background: #0c0c0c;
+  --foreground: #f5f5f5;
+  --card: #141414;
+  --card-foreground: #f5f5f5;
+  --popover: #141414;
+  --popover-foreground: #f5f5f5;
+  --primary: #f5f5f5;
+  --primary-foreground: #0c0c0c;
+  --secondary: #1c1c1c;
+  --secondary-foreground: #f5f5f5;
+  --muted: #1c1c1c;
+  --muted-foreground: #a3a3a3;
+  --accent: #1c1c1c;
+  --accent-foreground: #f5f5f5;
+  --destructive: #ef4444;
+  --border: #262626;
+  --input: #262626;
+  --ring: #525252;
+  color-scheme: dark;
 }
 
 @layer base {

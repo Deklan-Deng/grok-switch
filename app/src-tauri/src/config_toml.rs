@@ -30,10 +30,6 @@ pub fn expand_path(path: &str) -> String {
     trimmed.to_string()
 }
 
-pub fn backup_path(path: &str) -> String {
-    format!("{path}.grok-switch-backup")
-}
-
 fn toml_value(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -427,7 +423,6 @@ pub fn build_preview(config_path: &str, upsert: &ModelUpsert, snapshot: &ConfigS
         ));
     }
 
-    lines.push(format!("备份：{}", backup_path(&path)));
     lines.join("\n")
 }
 

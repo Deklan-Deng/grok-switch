@@ -82,19 +82,12 @@ fn tray_tooltip(store: &AppStore) -> String {
         .and_then(|cid| snap.profiles.iter().find(|p| p.id == cid))
     {
         Some(p) => {
-            if let Some(h) = health_for(store, p.id) {
-                if h.ok {
-                    let ms = h
-                        .latency_ms
-                        .map(|v| format!(" · {v}ms"))
-                        .unwrap_or_default();
-                    format!("Grok Switch · {}{ms}", p.name)
-                } else {
-                    format!("Grok Switch · {} · {}", p.name, h.title)
-                }
-            } else {
-                format!("Grok Switch · {}", p.name)
+            let mut line = format!("Grok Switch · {}", p.name);
+            if let Some(host) = host_of(p.base_url.as_deref()) {
+                line.push_str(" · ");
+                line.push_str(&host);
             }
+            line
         }
         None => "Grok Switch · 未启用".into(),
     }
@@ -124,10 +117,11 @@ fn profile_label(profile: &TokenProfile, is_current: bool) -> String {
 fn build_menu(app: &AppHandle<Wry>, store: &AppStore) -> Result<Menu<Wry>, String> {
     let snap = store.list_profiles();
     let current = snap.current_id;
-    let usage = store.usage_summary(Some(24));
+    // Cache only — never scan logs on the menu/main thread.
+    let usage = store.usage_cached(Some(24));
     let menu = Menu::new(app).map_err(|e| e.to_string())?;
 
-    // —— 当前：只留名称 + 模型/端点一行 + 健康一行 ——
+    // —— 当前：名称 + 模型/端点 ——
     match current.and_then(|cid| snap.profiles.iter().find(|p| p.id == cid)) {
         Some(p) => {
             append_info(&menu, app, "tray-header", format!("当前 · {}", p.name))?;
@@ -139,23 +133,26 @@ fn build_menu(app: &AppHandle<Wry>, store: &AppStore) -> Result<Menu<Wry>, Strin
             }
             append_info(&menu, app, "tray-meta", meta)?;
 
-            let health_line = match health_for(store, p.id) {
-                Some(h) if h.ok => match h.latency_ms {
-                    Some(ms) => format!("健康 · {ms}ms"),
-                    None => "健康 · 正常".into(),
-                },
-                Some(h) => format!("健康 · {}", h.title),
-                None => "健康 · 未检测".into(),
-            };
-            append_info(&menu, app, "tray-health-info", health_line)?;
+            // Only show health when already probed (no “未检测” noise).
+            if let Some(h) = health_for(store, p.id) {
+                let health_line = if h.ok {
+                    match h.latency_ms {
+                        Some(ms) => format!("延迟 · {ms}ms"),
+                        None => "连通正常".into(),
+                    }
+                } else {
+                    format!("异常 · {}", h.title)
+                };
+                append_info(&menu, app, "tray-health-info", health_line)?;
+            }
         }
         None => {
             append_info(&menu, app, "tray-header", "当前 · 未启用")?;
         }
     }
 
-    // —— 用量：一行 ——
-    if usage.has_data {
+    // —— 用量：一行（仅缓存命中时显示）——
+    if let Some(usage) = usage.filter(|u| u.has_data) {
         let mut line = format!(
             "24h · {} 次 · {}",
             usage.total_calls,
@@ -163,6 +160,8 @@ fn build_menu(app: &AppHandle<Wry>, store: &AppStore) -> Result<Menu<Wry>, Strin
         );
         if usage.rate_limit_count > 0 {
             line.push_str(&format!(" · 限流 {}", usage.rate_limit_count));
+        } else if usage.error_count > 0 {
+            line.push_str(&format!(" · 失败 {}", usage.error_count));
         }
         append_info(&menu, app, "tray-usage", line)?;
     }
@@ -190,13 +189,10 @@ fn build_menu(app: &AppHandle<Wry>, store: &AppStore) -> Result<Menu<Wry>, Strin
 
     let open = MenuItem::with_id(app, "tray-open", "打开主窗口", true, None::<&str>)
         .map_err(|e| e.to_string())?;
-    let health = MenuItem::with_id(app, "tray-health", "检查健康度", true, None::<&str>)
-        .map_err(|e| e.to_string())?;
     let quit = MenuItem::with_id(app, "tray-quit", "退出", true, None::<&str>)
         .map_err(|e| e.to_string())?;
 
     menu.append(&open).map_err(|e| e.to_string())?;
-    menu.append(&health).map_err(|e| e.to_string())?;
     menu.append(&quit).map_err(|e| e.to_string())?;
 
     Ok(menu)
@@ -219,41 +215,19 @@ fn handle_menu_event(app: &AppHandle<Wry>, id: &str) {
         "tray-quit" => {
             app.exit(0);
         }
-        "tray-health" => {
-            if let Some(state) = app.try_state::<TrayState>() {
-                let store = state.store.clone();
-                let app = app.clone();
-                // Network probe off the UI/menu thread to avoid tray freezes.
-                std::thread::spawn(move || {
-                    let snap = store.list_profiles();
-                    if let Some(cid) = snap.current_id {
-                        let _ = app.emit("app://status", "正在检查当前供应商健康度…");
-                        let result = store.check_health(cid);
-                        let _ = app.emit("app://health", &result);
-                        let _ = app.emit("app://status", result.status_line());
-                        let _ = rebuild_tray_menu(&app, &store);
-                    } else {
-                        let _ = app.emit("app://status", "未启用供应商，无法检查健康度。");
-                    }
-                });
-            }
-        }
         other if other.starts_with("switch:") => {
             let id_str = &other["switch:".len()..];
             if let Ok(uuid) = Uuid::parse_str(id_str) {
                 if let Some(state) = app.try_state::<TrayState>() {
                     let store = state.store.clone();
                     let app = app.clone();
-                    // Apply + health both off the menu thread so switching never freezes the tray.
+                    // Apply + optional probe off the menu thread so switching never freezes the tray.
                     let _ = app.emit("app://status", "正在切换供应商…");
                     std::thread::spawn(move || {
                         let result = store.apply_token(Some(uuid), None);
                         let _ = app.emit("app://state", &result);
-                        let _ = app.emit(
-                            "app://status",
-                            format!("{} · 正在检查健康度…", result.status),
-                        );
                         let _ = rebuild_tray_menu(&app, &store);
+                        // Quiet connectivity probe after switch — only updates cache / status.
                         let health = store.check_health(uuid);
                         let _ = app.emit("app://health", &health);
                         let _ = app.emit(

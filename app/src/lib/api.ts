@@ -103,10 +103,19 @@ export type SpeedTestResult = {
 };
 
 export type UsageError = {
+  id: string;
   at: number;
+  /** Short label, e.g. "网关超时 (524)". */
+  title: string;
+  /** One-line summary. */
   message: string;
+  /** Full raw text for copy. */
+  detail: string;
   model?: string | null;
+  /** rate_limit | cancelled | api_error | error */
   kind: string;
+  logMsg: string;
+  sid?: string | null;
 };
 
 export type ModelUsage = {
@@ -115,6 +124,7 @@ export type ModelUsage = {
   promptTokens: number;
   completionTokens: number;
   reasoningTokens: number;
+  cachedPromptTokens: number;
 };
 
 export type UsageSummary = {
@@ -125,10 +135,15 @@ export type UsageSummary = {
   reasoningTokens: number;
   cachedPromptTokens: number;
   totalTokens: number;
+  /** prompt − cached (approx. non-cached input). */
+  freshPromptTokens: number;
   avgTokensPerSec?: number | null;
   avgLatencyMs?: number | null;
+  avgTtftMs?: number | null;
+  /** Real failures (API / parse / rate limit), not user cancel. */
   errorCount: number;
   rateLimitCount: number;
+  cancelledCount: number;
   recentErrors: UsageError[];
   byModel: ModelUsage[];
   source: string;
@@ -144,9 +159,6 @@ export function checkHealth(id: string) {
   return invoke<HealthResult>("check_health", { id });
 }
 
-export function checkAllHealth() {
-  return invoke<HealthResult[]>("check_all_health");
-}
 
 export function runSpeedTest(id: string) {
   return invoke<SpeedTestResult>("run_speed_test", { id });
@@ -156,6 +168,11 @@ export function lastSpeedTests() {
   return invoke<SpeedTestResult[]>("last_speed_tests");
 }
 
-export function getUsageSummary(windowHours = 24) {
-  return invoke<UsageSummary>("usage_summary", { windowHours });
+export function getUsageSummary(windowHours = 24, force = false) {
+  return invoke<UsageSummary>("usage_summary", { windowHours, force });
+}
+
+/** In-process health results from the last probes (no network). */
+export function lastHealth() {
+  return invoke<HealthResult[]>("last_health");
 }

@@ -2,13 +2,14 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Activity,
   Check,
+  Copy,
   Download,
   Gauge,
   Loader2,
@@ -16,14 +17,15 @@ import {
   Pencil,
   Plus,
   RefreshCw,
-  RotateCcw,
   Trash2,
 } from "lucide-react";
+import { ThemeToggle } from "@/components/ThemeToggle";
+import type { UsageError } from "@/lib/api";
 import {
   callApi,
-  checkAllHealth,
   checkHealth,
   getUsageSummary,
+  lastHealth,
   runSpeedTest,
   type CommandResult,
   type CreateProviderInput,
@@ -95,7 +97,7 @@ function formToPatch(id: string, form: EditorForm): ProfilePatch {
 function formToCreate(form: EditorForm, enable: boolean): CreateProviderInput {
   return {
     name: form.name.trim(),
-    modelId: form.modelId.trim(),
+    modelId: form.modelId.trim(), // ProviderEditor already resolves from name if empty
     apiModel: form.apiModel || null,
     modelAlias: form.modelAlias || null,
     description: form.description || null,
@@ -126,6 +128,7 @@ export default function App() {
 
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<TokenProfile | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
   /** In-flight speed tests by profile id — several cards can run in parallel. */
   const [speedTestingIds, setSpeedTestingIds] = useState<Record<string, true>>({});
   const [enablingId, setEnablingId] = useState<string | null>(null);
@@ -134,7 +137,6 @@ export default function App() {
   const [speedDialog, setSpeedDialog] = useState<SpeedTestResult | null>(null);
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
-  const [healthScanning, setHealthScanning] = useState(false);
 
   const current = useMemo(
     () => profiles.find((p) => p.id === currentId) ?? null,
@@ -176,10 +178,10 @@ export default function App() {
     [applyResult],
   );
 
-  const refreshUsage = useCallback(async () => {
+  const refreshUsage = useCallback(async (force = false) => {
     setUsageLoading(true);
     try {
-      setUsage(await getUsageSummary(24));
+      setUsage(await getUsageSummary(24, force));
     } catch (err) {
       setStatus(`用量读取失败：${String(err)}`);
     } finally {
@@ -191,25 +193,56 @@ export default function App() {
     setHealthMap((prev) => ({ ...prev, [h.profileId]: h }));
   }, []);
 
+  // Boot: list first, then defer probes so the first paint is always clickable.
   useEffect(() => {
+    let cancelled = false;
+    let deferred: number | undefined;
     void (async () => {
       try {
         const state = await callApi("get_state");
+        if (cancelled) return;
         applyResult(state);
-        // Auto health-check current provider on boot (explainable, not just ping).
-        if (state.currentId) {
-          try {
-            upsertHealth(await checkHealth(state.currentId));
-          } catch {
-            /* ignore boot health errors */
+
+        // Cached health chip only (no network on open).
+        try {
+          const cached = await lastHealth();
+          if (!cancelled && cached.length) {
+            setHealthMap((prev) => {
+              const next = { ...prev };
+              for (const h of cached) next[h.profileId] = h;
+              return next;
+            });
           }
+        } catch {
+          /* ignore missing cache */
         }
-        await refreshUsage();
+
+        // After first paint + a short idle: usage + optional health in background.
+        // Opening must never wait on third-party /models or multi-MB log scans.
+        deferred = window.setTimeout(() => {
+          if (cancelled) return;
+          void refreshUsage(false);
+          if (state.currentId) {
+            void checkHealth(state.currentId)
+              .then((h) => {
+                if (!cancelled) upsertHealth(h);
+              })
+              .catch(() => {
+                /* ignore boot health errors */
+              });
+          }
+        }, 400);
       } catch (err) {
-        setBootError(String(err));
-        setStatus(`初始化失败：${String(err)}`);
+        if (!cancelled) {
+          setBootError(String(err));
+          setStatus(`初始化失败：${String(err)}`);
+        }
       }
     })();
+    return () => {
+      cancelled = true;
+      if (deferred !== undefined) window.clearTimeout(deferred);
+    };
   }, [applyResult, refreshUsage, upsertHealth]);
 
   // Menu bar tray can switch providers / push status while window is hidden.
@@ -370,28 +403,6 @@ export default function App() {
     }
   };
 
-  const handleScanAllHealth = async () => {
-    setHealthScanning(true);
-    setStatus("正在并行体检全部供应商…");
-    await paintThen();
-    try {
-      const list = await checkAllHealth();
-      const next: Record<string, HealthResult> = {};
-      for (const h of list) next[h.profileId] = h;
-      setHealthMap(next);
-      const bad = list.filter((h) => !h.ok).length;
-      setStatus(
-        bad === 0
-          ? `全部 ${list.length} 个供应商健康`
-          : `体检完成：${list.length - bad} 正常 · ${bad} 异常`,
-      );
-    } catch (err) {
-      setStatus(`批量体检失败：${String(err)}`);
-    } finally {
-      setHealthScanning(false);
-    }
-  };
-
   const showChrome = view.kind === "list" || view.kind === "tools";
 
   return (
@@ -436,44 +447,28 @@ export default function App() {
               </div>
             </div>
 
-            {view.kind === "list" ? (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy || healthScanning}
-                  onClick={() => void handleScanAllHealth()}
-                >
-                  {healthScanning ? <Loader2 className="animate-spin" /> : <Activity />}
-                  体检
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => void run("import_from_config", {})}
-                >
-                  <Download />
-                  导入
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() =>
-                    void run("restore_backup", {
-                      configPath: current?.configPath ?? profiles[0]?.configPath,
-                    })
-                  }
-                >
-                  <RotateCcw />
-                  恢复
-                </Button>
-                <Button size="sm" onClick={openCreate}>
-                  <Plus />
-                  添加
-                </Button>
-              </div>
-            ) : null}
+            <div className="flex flex-wrap items-center gap-1.5">
+              {view.kind === "list" ? (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    disabled={busy}
+                    title="从 config.toml 导入"
+                    aria-label="从 config.toml 导入"
+                    onClick={() => setImportOpen(true)}
+                  >
+                    <Download />
+                  </Button>
+                  <Button size="sm" onClick={openCreate}>
+                    <Plus />
+                    添加
+                  </Button>
+                </>
+              ) : null}
+              <ThemeToggle />
+            </div>
           </header>
 
           <StatusBar
@@ -482,7 +477,7 @@ export default function App() {
             health={currentHealth}
             usage={usage}
             usageLoading={usageLoading}
-            onRefreshUsage={() => void refreshUsage()}
+            onRefreshUsage={() => void refreshUsage(true)}
           />
         </>
       ) : null}
@@ -634,6 +629,31 @@ export default function App() {
               }}
             >
               删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={importOpen} onOpenChange={setImportOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>从 config.toml 导入？</DialogTitle>
+            <DialogDescription>
+              读取 ~/.grok/config.toml 中尚未在列表里的模型段，添加为供应商卡片。不会导入
+              API Key，已有同名段名会跳过。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setImportOpen(false)}>
+              取消
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => {
+                void run("import_from_config", {}).then(() => setImportOpen(false));
+              }}
+            >
+              导入
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -864,6 +884,73 @@ function StatusBar({
   );
 }
 
+/**
+ * Click-to-pin popover. Hover panels disappear when the cursor crosses the gap;
+ * copy / scroll need a sticky panel.
+ */
+function ClickPopover({
+  open,
+  onOpenChange,
+  trigger,
+  children,
+  align = "end",
+  widthClass = "w-80",
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  trigger: ReactNode;
+  children: ReactNode;
+  align?: "start" | "end";
+  widthClass?: string;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const el = rootRef.current;
+      if (!el) return;
+      const t = e.target as Node | null;
+      if (t && el.contains(t)) return;
+      // Portaled dialogs (error log) live outside this tree — keep popover logic
+      // from fighting them: only close if the click is not inside a dialog.
+      if (t instanceof Element && t.closest('[role="dialog"]')) return;
+      onOpenChange(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onOpenChange(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, onOpenChange]);
+
+  return (
+    <div className="relative" ref={rootRef}>
+      {trigger}
+      {open ? (
+        <div
+          className={cn(
+            "absolute top-full z-50 mt-1.5",
+            widthClass,
+            align === "end" ? "right-0" : "left-0",
+          )}
+          role="dialog"
+          aria-modal="false"
+        >
+          <div className="max-h-[min(70vh,520px)] overflow-y-auto overflow-x-hidden rounded-lg border border-border bg-card p-3 shadow-lg shadow-black/20">
+            {children}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Light hover panel for non-interactive previews (health chip). */
 function HoverPanel({
   children,
   panel,
@@ -873,21 +960,56 @@ function HoverPanel({
   panel: ReactNode;
   align?: "start" | "end";
 }) {
+  const [open, setOpen] = useState(false);
+  const closeTimer = useRef<number | null>(null);
+
+  const clearClose = () => {
+    if (closeTimer.current != null) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  };
+
+  const scheduleClose = () => {
+    clearClose();
+    closeTimer.current = window.setTimeout(() => setOpen(false), 200);
+  };
+
+  useEffect(() => () => clearClose(), []);
+
   return (
-    <div className="group relative">
+    <div
+      className="relative"
+      onMouseEnter={() => {
+        clearClose();
+        setOpen(true);
+      }}
+      onMouseLeave={scheduleClose}
+      onFocusCapture={() => {
+        clearClose();
+        setOpen(true);
+      }}
+      onBlurCapture={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          scheduleClose();
+        }
+      }}
+    >
       {children}
-      <div
-        className={cn(
-          "pointer-events-none invisible absolute top-full z-50 mt-1.5 w-72 translate-y-0.5 opacity-0 transition-all duration-150",
-          "group-hover:pointer-events-auto group-hover:visible group-hover:translate-y-0 group-hover:opacity-100",
-          "group-focus-within:pointer-events-auto group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:opacity-100",
-          align === "end" ? "right-0" : "left-0",
-        )}
-      >
-        <div className="overflow-hidden rounded-lg border border-border bg-card p-3 shadow-lg shadow-black/20">
-          {panel}
+      {open ? (
+        <div
+          className={cn(
+            // pt-1.5 acts as an invisible hover bridge (no dead gap).
+            "absolute top-full z-50 w-80 pt-1.5",
+            align === "end" ? "right-0" : "left-0",
+          )}
+          onMouseEnter={clearClose}
+        >
+          <div className="overflow-hidden rounded-lg border border-border bg-card p-3 shadow-lg shadow-black/20">
+            {panel}
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }
@@ -992,6 +1114,259 @@ function HealthHoverChip({ health }: { health: HealthResult }) {
   );
 }
 
+function formatLatency(ms?: number | null): string {
+  if (ms == null || !Number.isFinite(ms)) return "—";
+  if (ms >= 10_000) return `${(ms / 1000).toFixed(0)}s`;
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.round(ms)}ms`;
+}
+
+function issueKindLabel(kind: string): string {
+  switch (kind) {
+    case "rate_limit":
+      return "限流";
+    case "cancelled":
+      return "取消";
+    case "api_error":
+      return "失败";
+    default:
+      return "问题";
+  }
+}
+
+function formatErrorTime(at: number): string {
+  if (!at) return "—";
+  try {
+    const d = new Date(at);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch {
+    return "—";
+  }
+}
+
+function errorCopyText(e: UsageError): string {
+  const lines = [
+    `[${formatErrorTime(e.at)}] ${e.title}`,
+    `kind: ${e.kind}`,
+    e.model ? `model: ${e.model}` : null,
+    e.sid ? `sid: ${e.sid}` : null,
+    e.logMsg ? `log: ${e.logMsg}` : null,
+    "",
+    e.detail || e.message,
+  ].filter((x) => x != null);
+  return lines.join("\n");
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function CopyErrorButton({
+  error,
+  className,
+}: {
+  error: UsageError;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className={cn(
+        "inline-flex h-6 items-center gap-1 rounded-md border border-border px-1.5 text-[10px] text-muted-foreground transition-colors hover:text-foreground",
+        className,
+      )}
+      title="复制完整错误"
+      onClick={(ev) => {
+        ev.stopPropagation();
+        void copyText(errorCopyText(error)).then((ok) => {
+          if (!ok) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1200);
+        });
+      }}
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      {copied ? "已复制" : "复制"}
+    </button>
+  );
+}
+
+function ErrorLogDialog({
+  open,
+  onOpenChange,
+  errors,
+  windowHours,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  errors: UsageError[];
+  windowHours: number;
+}) {
+  const [filter, setFilter] = useState<"actionable" | "all">("actionable");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [copiedAll, setCopiedAll] = useState(false);
+
+  const list = useMemo(() => {
+    if (filter === "all") return errors;
+    return errors.filter((e) => e.kind !== "cancelled");
+  }, [errors, filter]);
+
+  const copyAll = async () => {
+    if (!list.length) return;
+    const body = list.map((e, i) => `--- #${i + 1} ---\n${errorCopyText(e)}`).join("\n\n");
+    const ok = await copyText(body);
+    if (ok) {
+      setCopiedAll(true);
+      window.setTimeout(() => setCopiedAll(false), 1500);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[min(80vh,640px)] flex-col gap-0 overflow-hidden p-0 sm:max-w-lg">
+        <DialogHeader className="shrink-0 space-y-1 border-b border-border px-4 py-3">
+          <DialogTitle className="text-sm">错误记录</DialogTitle>
+          <DialogDescription className="text-[11px]">
+            近 {windowHours} 小时 · 每条独立事件 · 可复制全文
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-2">
+          <div className="flex items-center rounded-md border border-border p-0.5 text-[11px]">
+            <button
+              type="button"
+              className={cn(
+                "rounded px-2 py-0.5 transition-colors",
+                filter === "actionable"
+                  ? "bg-foreground text-background"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              onClick={() => setFilter("actionable")}
+            >
+              失败 / 限流
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "rounded px-2 py-0.5 transition-colors",
+                filter === "all"
+                  ? "bg-foreground text-background"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              onClick={() => setFilter("all")}
+            >
+              全部
+            </button>
+          </div>
+          <button
+            type="button"
+            disabled={!list.length}
+            onClick={() => void copyAll()}
+            className="inline-flex h-7 items-center gap-1 rounded-md border border-border px-2 text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+          >
+            {copiedAll ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+            {copiedAll ? "已复制全部" : `复制全部 (${list.length})`}
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+          {list.length === 0 ? (
+            <p className="px-1 py-8 text-center text-xs text-muted-foreground">
+              {filter === "actionable" ? "暂无失败 / 限流记录" : "暂无错误记录"}
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {list.map((e) => {
+                const isExpanded = expandedId === e.id;
+                return (
+                  <li
+                    key={e.id}
+                    className="rounded-lg border border-border bg-card"
+                  >
+                    <div className="flex items-start gap-2 px-2.5 py-2">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 text-left"
+                        onClick={() =>
+                          setExpandedId((id) => (id === e.id ? null : e.id))
+                        }
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span
+                            className={cn(
+                              "rounded px-1 py-px text-[9px]",
+                              e.kind === "cancelled"
+                                ? "bg-muted text-muted-foreground"
+                                : "bg-destructive/10 text-destructive",
+                            )}
+                          >
+                            {issueKindLabel(e.kind)}
+                          </span>
+                          <span className="text-[10px] tabular-nums text-muted-foreground">
+                            {formatErrorTime(e.at)}
+                          </span>
+                          {e.model ? (
+                            <span className="truncate font-mono text-[10px] text-muted-foreground">
+                              {e.model}
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className="mt-1 text-[12px] font-medium leading-snug text-foreground">
+                          {e.title}
+                        </p>
+                        {!isExpanded ? (
+                          <p className="mt-0.5 line-clamp-2 font-mono text-[10px] leading-relaxed text-muted-foreground">
+                            {e.message}
+                          </p>
+                        ) : null}
+                      </button>
+                      <CopyErrorButton error={e} />
+                    </div>
+                    {isExpanded ? (
+                      <div className="border-t border-border px-2.5 py-2">
+                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[10px] leading-relaxed text-foreground">
+                          {e.detail || e.message}
+                        </pre>
+                        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+                          {e.logMsg ? <span>log: {e.logMsg}</span> : null}
+                          {e.sid ? (
+                            <span className="font-mono" title={e.sid}>
+                              sid: {e.sid.slice(0, 8)}…
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function UsageHoverChip({
   usage,
   loading,
@@ -1001,9 +1376,28 @@ function UsageHoverChip({
   loading: boolean;
   onRefresh: () => void;
 }) {
-  const tokenParts = usage?.hasData
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [errorLogOpen, setErrorLogOpen] = useState(false);
+  const modelMax = Math.max(1, ...(usage?.byModel.map((m) => m.calls) ?? [1]));
+  const cacheHitPct =
+    usage && usage.promptTokens > 0
+      ? Math.round((usage.cachedPromptTokens / usage.promptTokens) * 100)
+      : null;
+
+  const tokenRows = usage?.hasData
     ? [
-        { key: "prompt", label: "输入", value: usage.promptTokens, tone: "bg-foreground/80" },
+        {
+          key: "fresh",
+          label: "新输入",
+          value: usage.freshPromptTokens,
+          tone: "bg-foreground/80",
+        },
+        {
+          key: "cached",
+          label: "缓存命中",
+          value: usage.cachedPromptTokens,
+          tone: "bg-emerald-500/70",
+        },
         {
           key: "completion",
           label: "输出",
@@ -1016,24 +1410,80 @@ function UsageHoverChip({
           value: usage.reasoningTokens,
           tone: "bg-foreground/25",
         },
-      ]
+      ].filter((r) => r.value > 0)
     : [];
-  const tokenTotal = Math.max(
-    1,
-    tokenParts.reduce((sum, p) => sum + p.value, 0),
-  );
-  const modelMax = Math.max(1, ...(usage?.byModel.map((m) => m.calls) ?? [1]));
+  const tokenRowMax = Math.max(1, ...tokenRows.map((r) => r.value));
+
+  const previewErrors = useMemo(() => {
+    if (!usage?.recentErrors?.length) return [];
+    const actionable = usage.recentErrors.filter((e) => e.kind !== "cancelled");
+    return (actionable.length ? actionable : usage.recentErrors).slice(0, 5);
+  }, [usage]);
+
+  const chipAlert =
+    usage && usage.rateLimitCount > 0
+      ? { text: `${usage.rateLimitCount} 限流`, danger: true }
+      : usage && usage.errorCount > 0
+        ? { text: `${usage.errorCount} 失败`, danger: true }
+        : null;
 
   return (
-    <HoverPanel
-      panel={
-        usage?.hasData ? (
+    <>
+      <ClickPopover
+        open={panelOpen}
+        onOpenChange={setPanelOpen}
+        align="end"
+        widthClass="w-80"
+        trigger={
+          <button
+            type="button"
+            aria-expanded={panelOpen}
+            aria-haspopup="dialog"
+            title={panelOpen ? "点击关闭用量面板" : "点击打开用量面板（可复制错误）"}
+            onClick={() => {
+              setPanelOpen((v) => !v);
+              // Soft refresh when opening so the list is current.
+              if (!panelOpen && !loading) onRefresh();
+            }}
+            className={cn(
+              "inline-flex h-6 max-w-[240px] items-center gap-1.5 rounded-full border bg-background px-2 text-[11px] transition-colors",
+              panelOpen
+                ? "border-foreground/40 text-foreground"
+                : "border-border text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {loading ? (
+              <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3 w-3 shrink-0 opacity-60" />
+            )}
+            {usage?.hasData ? (
+              <>
+                <span className="tabular-nums">{usage.totalCalls}</span>
+                <span className="text-muted-foreground/40">·</span>
+                <span className="tabular-nums">{formatTokens(usage.totalTokens)}</span>
+                {chipAlert ? (
+                  <>
+                    <span className="text-muted-foreground/40">·</span>
+                    <span className={chipAlert.danger ? "text-destructive" : undefined}>
+                      {chipAlert.text}
+                    </span>
+                  </>
+                ) : null}
+              </>
+            ) : (
+              <span>用量</span>
+            )}
+          </button>
+        }
+      >
+        {usage?.hasData ? (
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <div className="text-xs font-medium text-foreground">用量概览</div>
                 <div className="text-[11px] text-muted-foreground">
-                  近 {usage.windowHours} 小时 · 本地日志
+                  近 {usage.windowHours} 小时 · 点击固定 · 可复制错误
                 </div>
               </div>
               <button
@@ -1051,48 +1501,53 @@ function UsageHoverChip({
               </button>
             </div>
 
-            <div className="grid grid-cols-3 gap-1.5">
-              <StatCell label="调用" value={String(usage.totalCalls)} />
+            <div className="grid grid-cols-4 gap-1.5">
+              <StatCell label="成功" value={String(usage.totalCalls)} />
               <StatCell label="Tokens" value={formatTokens(usage.totalTokens)} />
               <StatCell
-                label="均时"
-                value={
-                  usage.avgLatencyMs != null
-                    ? `${Math.round(usage.avgLatencyMs / 1000)}s`
-                    : "—"
-                }
+                label="TTFT"
+                value={formatLatency(usage.avgTtftMs)}
+                hint="首字延迟均值"
+              />
+              <StatCell
+                label="总耗时"
+                value={formatLatency(usage.avgLatencyMs)}
+                hint="模型推理均值"
               />
             </div>
 
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-[11px] text-muted-foreground">
                 <span>Token 构成</span>
-                <span className="tabular-nums text-foreground">
-                  {formatTokens(usage.totalTokens)}
-                </span>
+                {cacheHitPct != null ? (
+                  <span className="tabular-nums text-emerald-600 dark:text-emerald-400">
+                    缓存命中 {cacheHitPct}%
+                  </span>
+                ) : (
+                  <span className="tabular-nums text-foreground">
+                    {formatTokens(usage.totalTokens)}
+                  </span>
+                )}
               </div>
-              <div className="flex h-2 overflow-hidden rounded-full bg-muted">
-                {tokenParts.map((p) => {
-                  const pct = (p.value / tokenTotal) * 100;
-                  if (pct < 0.4) return null;
+              <ul className="space-y-1">
+                {tokenRows.map((r) => {
+                  const pct = Math.max(3, Math.round((r.value / tokenRowMax) * 100));
                   return (
-                    <div
-                      key={p.key}
-                      className={cn("h-full", p.tone)}
-                      style={{ width: `${pct}%` }}
-                      title={`${p.label} ${formatTokens(p.value)}`}
-                    />
+                    <li key={r.key} className="flex items-center gap-2 text-[11px]">
+                      <span className="w-14 shrink-0 text-muted-foreground">{r.label}</span>
+                      <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                        <div
+                          className={cn("h-full rounded-full", r.tone)}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <span className="w-12 shrink-0 text-right tabular-nums text-foreground">
+                        {formatTokens(r.value)}
+                      </span>
+                    </li>
                   );
                 })}
-              </div>
-              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
-                {tokenParts.map((p) => (
-                  <span key={p.key} className="inline-flex items-center gap-1">
-                    <span className={cn("h-1.5 w-1.5 rounded-full", p.tone)} />
-                    {p.label} {formatTokens(p.value)}
-                  </span>
-                ))}
-              </div>
+              </ul>
             </div>
 
             {usage.byModel.length > 0 ? (
@@ -1101,6 +1556,8 @@ function UsageHoverChip({
                 <ul className="space-y-1.5">
                   {usage.byModel.slice(0, 5).map((m) => {
                     const pct = Math.max(4, Math.round((m.calls / modelMax) * 100));
+                    const tokens =
+                      m.promptTokens + m.completionTokens + m.reasoningTokens;
                     return (
                       <li key={m.model} className="space-y-0.5">
                         <div className="flex items-center justify-between gap-2 text-[11px]">
@@ -1108,7 +1565,7 @@ function UsageHoverChip({
                             {m.model}
                           </span>
                           <span className="shrink-0 tabular-nums text-muted-foreground">
-                            {m.calls} 次 · {formatTokens(m.promptTokens + m.completionTokens)}
+                            {m.calls} 次 · {formatTokens(tokens)}
                           </span>
                         </div>
                         <div className="h-1 overflow-hidden rounded-full bg-muted">
@@ -1124,33 +1581,75 @@ function UsageHoverChip({
               </div>
             ) : null}
 
-            {(usage.rateLimitCount > 0 || usage.errorCount > 0) && (
-              <div className="flex gap-1.5">
+            {(usage.rateLimitCount > 0 ||
+              usage.errorCount > 0 ||
+              usage.cancelledCount > 0) && (
+              <div className="flex flex-wrap items-center gap-1.5">
                 {usage.rateLimitCount > 0 ? (
                   <span className="rounded-md border border-destructive/30 bg-destructive/5 px-1.5 py-0.5 text-[10px] text-destructive">
                     限流 {usage.rateLimitCount}
                   </span>
                 ) : null}
                 {usage.errorCount > 0 ? (
+                  <span className="rounded-md border border-destructive/30 bg-destructive/5 px-1.5 py-0.5 text-[10px] text-destructive">
+                    失败 {usage.errorCount}
+                  </span>
+                ) : null}
+                {usage.cancelledCount > 0 ? (
                   <span className="rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                    错误 {usage.errorCount}
+                    取消 {usage.cancelledCount}
                   </span>
                 ) : null}
               </div>
             )}
 
             {usage.recentErrors.length > 0 ? (
-              <div className="space-y-1 border-t border-border pt-2">
-                <div className="text-[11px] text-muted-foreground">最近问题</div>
-                <ul className="space-y-1">
-                  {usage.recentErrors.slice(0, 3).map((e, i) => (
+              <div className="space-y-1.5 border-t border-border pt-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[11px] text-muted-foreground">最近错误</div>
+                  <button
+                    type="button"
+                    className="text-[11px] text-foreground underline-offset-2 hover:underline"
+                    onClick={() => setErrorLogOpen(true)}
+                  >
+                    查看全部 ({usage.recentErrors.length})
+                  </button>
+                </div>
+                <ul className="space-y-1.5">
+                  {previewErrors.map((e) => (
                     <li
-                      key={`${e.at}-${i}`}
-                      className="line-clamp-2 text-[10px] leading-relaxed text-muted-foreground"
-                      title={e.message}
+                      key={e.id}
+                      className="rounded-md border border-border bg-background px-2 py-1.5"
                     >
-                      {e.kind === "rate_limit" ? "限流 · " : "错误 · "}
-                      {e.message}
+                      <div className="flex items-start gap-1.5">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span
+                              className={cn(
+                                "rounded px-1 py-px text-[9px]",
+                                e.kind === "cancelled"
+                                  ? "bg-muted text-muted-foreground"
+                                  : "bg-destructive/10 text-destructive",
+                              )}
+                            >
+                              {issueKindLabel(e.kind)}
+                            </span>
+                            <span className="text-[10px] tabular-nums text-muted-foreground">
+                              {formatErrorTime(e.at)}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-[11px] font-medium leading-snug text-foreground">
+                            {e.title}
+                          </p>
+                          <p
+                            className="mt-0.5 line-clamp-2 font-mono text-[10px] leading-relaxed text-muted-foreground"
+                            title={e.message}
+                          >
+                            {e.message}
+                          </p>
+                        </div>
+                        <CopyErrorButton error={e} />
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -1169,43 +1668,33 @@ function UsageHoverChip({
               {loading ? "读取中…" : "刷新试试"}
             </button>
           </div>
-        )
-      }
-    >
-      <button
-        type="button"
-        onClick={onRefresh}
-        disabled={loading}
-        className="inline-flex h-6 max-w-[220px] items-center gap-1.5 rounded-full border border-border bg-background px-2 text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
-      >
-        {loading ? (
-          <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
-        ) : (
-          <RefreshCw className="h-3 w-3 shrink-0 opacity-60" />
         )}
-        {usage?.hasData ? (
-          <>
-            <span className="tabular-nums">{usage.totalCalls}</span>
-            <span className="text-muted-foreground/40">·</span>
-            <span className="tabular-nums">{formatTokens(usage.totalTokens)}</span>
-            {usage.rateLimitCount > 0 ? (
-              <>
-                <span className="text-muted-foreground/40">·</span>
-                <span className="text-destructive">{usage.rateLimitCount} 限流</span>
-              </>
-            ) : null}
-          </>
-        ) : (
-          <span>用量</span>
-        )}
-      </button>
-    </HoverPanel>
+      </ClickPopover>
+
+      <ErrorLogDialog
+        open={errorLogOpen}
+        onOpenChange={setErrorLogOpen}
+        errors={usage?.recentErrors ?? []}
+        windowHours={usage?.windowHours ?? 24}
+      />
+    </>
   );
 }
 
-function StatCell({ label, value }: { label: string; value: string }) {
+function StatCell({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+}) {
   return (
-    <div className="rounded-md border border-border bg-background px-2 py-1.5 text-center">
+    <div
+      className="rounded-md border border-border bg-background px-2 py-1.5 text-center"
+      title={hint}
+    >
       <div className="tabular-nums text-xs font-medium text-foreground">{value}</div>
       <div className="text-[10px] text-muted-foreground">{label}</div>
     </div>
