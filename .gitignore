@@ -1,0 +1,70 @@
+# Dependencies
+node_modules/
+.npm/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+out/
+*.app
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.msi
+*.exe
+
+# Rust / Tauri
+**/target/
+src-tauri/target/
+app/src-tauri/target/
+**/*.rs.bk
+
+# Env & local secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+secrets/
+credentials/
+
+# App / Grok user data that may contain API keys
+tokens.json
+profiles.json
+**/Application Support/GrokTokenSwitcher/
+**/.grok/config.toml
+**/*config.toml.backup*
+**/*.grok-switch-backup
+**/*.grok-token-switcher-backup
+
+# Logs & OS junk
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors / IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+
+# Test / coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Misc local
+.tmp/
+.temp/
+.cache/
+*.local
